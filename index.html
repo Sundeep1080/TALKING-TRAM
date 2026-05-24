@@ -5299,755 +5299,631 @@ function mcoZoomClose() {
 
 <script>
 /* ═══════════════════════════════════════════════════════════════
-   TRAM VOICE ASSISTANT  —  Firefox + Chrome/Edge compatible
-   ▸ Chrome/Edge  : native Web Speech API (hold-to-talk)
-   ▸ Firefox      : hold → MediaRecorder + Groq/OpenAI Whisper STT
-                    click → text-input fallback (no key needed)
-   ▸ TTS          : window.speechSynthesis on all browsers
-   ═══════════════════════════════════════════════════════════════ */
+   TRAM VOICE ASSISTANT  v4  —  DOM-click engine
+   Every command finds the real DOM element and clicks/fires it.
+   No function-name guessing. Behaves exactly like a mouse.
+═══════════════════════════════════════════════════════════════ */
 (function(){
-  'use strict';
+'use strict';
 
-  /* ── State ── */
-  var _vOn=false, _vRecog=null, _vLog=[], _vBusy=false;
-  var _vSynth=window.speechSynthesis;
-  var _vMediaStream=null, _vMediaChunks=[], _vHoldStart=0;
-  var _vLastList=[];   /* last shown signals — "open" uses this */
+/* ── State ──────────────────────────────────────────────────── */
+var _vSynth   = window.speechSynthesis;
+var _vBusy    = false;
+var _vLog     = [];
+var _vLastList= [];          /* last spoken signal list for "open 2" etc */
+var _vMediaRec= null;
+var _vMediaStream = null;
+var _vMediaChunks = [];
+var _vWisprTimer  = null;
+var _LK_ANTH  = 'tram_voice_apikey';
+var _LK_STT   = 'tram_stt_key';
+var _hasSR    = !!(window.SpeechRecognition||window.webkitSpeechRecognition);
+var _hasMedia = !!(window.MediaRecorder&&navigator.mediaDevices&&navigator.mediaDevices.getUserMedia);
 
-  /* ── LocalStorage keys ── */
-  var _LK_ANTH='tram_voice_apikey';
-  var _LK_STT ='tram_stt_key';          /* Groq gsk_… or OpenAI sk-… */
+/* ── Keys ───────────────────────────────────────────────────── */
+function vGetAnthKey(){ return localStorage.getItem(_LK_ANTH)||''; }
+function vGetSTTKey() { return localStorage.getItem(_LK_STT)||'';  }
+function vSTTEndpoint(k){
+  if(!k)return null;
+  return k.startsWith('gsk_')
+    ?'https://api.groq.com/openai/v1/audio/transcriptions'
+    :'https://api.openai.com/v1/audio/transcriptions';
+}
 
-  /* ── Capability detection ── */
-  var _hasSR   = !!(window.SpeechRecognition||window.webkitSpeechRecognition);
-  var _hasMedia= !!(window.MediaRecorder &&
-                    navigator.mediaDevices &&
-                    navigator.mediaDevices.getUserMedia);
-
-  /* ══════════════════════════════
-     KEY HELPERS
-  ══════════════════════════════ */
-  function vGetAnthKey(){ return localStorage.getItem(_LK_ANTH)||''; }
-  function vGetSTTKey() { return localStorage.getItem(_LK_STT) ||''; }
-
-  /* Auto-detect provider from key prefix */
-  function vSTTEndpoint(key){
-    if(!key)return null;
-    /* Groq keys start with gsk_ */
-    if(key.startsWith('gsk_'))
-      return 'https://api.groq.com/openai/v1/audio/transcriptions';
-    /* OpenAI keys start with sk- */
-    return 'https://api.openai.com/v1/audio/transcriptions';
+window.vSaveKey=function(){
+  var a=(document.getElementById('voiceApiKeyInp').value||'').trim();
+  if(a&&!a.endsWith('…')){ localStorage.setItem(_LK_ANTH,a); vLog('✓ Anthropic key saved'); }
+  else if(!a) localStorage.removeItem(_LK_ANTH);
+  var wi=document.getElementById('voiceWhisperKeyInp');
+  if(wi){
+    var s=(wi.value||'').trim();
+    if(s&&!s.endsWith('…')){
+      localStorage.setItem(_LK_STT,s);
+      vLog('✓ '+(s.startsWith('gsk_')?'Groq':'OpenAI')+' key saved');
+    } else if(!s) localStorage.removeItem(_LK_STT);
   }
-
-  window.vSaveKey=function(){
-    /* Anthropic key */
-    var a=(document.getElementById('voiceApiKeyInp').value||'').trim();
-    if(a&&!a.endsWith('…')){ localStorage.setItem(_LK_ANTH,a); vLog('✓ Anthropic key saved'); }
-    else if(!a){ localStorage.removeItem(_LK_ANTH); }
-
-    /* STT key (Groq or OpenAI) */
+  document.getElementById('voiceSettingsPanel').style.display='none';
+};
+window.vToggleSettings=function(){
+  var p=document.getElementById('voiceSettingsPanel');
+  var open=p.style.display!=='none';
+  p.style.display=open?'none':'block';
+  if(!open){
+    var ak=vGetAnthKey();
+    document.getElementById('voiceApiKeyInp').value=ak?ak.slice(0,14)+'…':'';
     var wi=document.getElementById('voiceWhisperKeyInp');
-    if(wi){
-      var s=(wi.value||'').trim();
-      if(s&&!s.endsWith('…')){
-        localStorage.setItem(_LK_STT,s);
-        var lbl=s.startsWith('gsk_')?'Groq':'OpenAI';
-        vLog('✓ '+lbl+' STT key saved');
-      } else if(!s){ localStorage.removeItem(_LK_STT); }
-    }
-    document.getElementById('voiceSettingsPanel').style.display='none';
-  };
-
-  window.vToggleSettings=function(){
-    var p=document.getElementById('voiceSettingsPanel');
-    var open=p.style.display!=='none';
-    p.style.display=open?'none':'block';
-    if(!open){
-      var ak=vGetAnthKey();
-      document.getElementById('voiceApiKeyInp').value=ak?ak.slice(0,14)+'…':'';
-      var wi=document.getElementById('voiceWhisperKeyInp');
-      if(wi){ var sk=vGetSTTKey(); wi.value=sk?sk.slice(0,14)+'…':''; }
-    }
-  };
-
-  /* ══════════════════════════════
-     TTS  —  Firefox-safe
-  ══════════════════════════════ */
-  function vSpeak(text){
-    if(!text||!_vSynth)return;
-    _vBusy=true;
-    /* Firefox: synth can get stuck in paused state after inactivity */
-    try{ if(_vSynth.paused) _vSynth.resume(); }catch(e){}
-    _vSynth.cancel();
-
-    var vv=_vSynth.getVoices();
-    var pick=vv.find(function(v){return v.lang==='en-IN';})
-             ||vv.find(function(v){return v.lang==='en-GB';})
-             ||vv.find(function(v){return v.lang.startsWith('en');});
-
-    /* Firefox cuts off utterances > ~15 s — split at sentence boundaries */
-    var chunks=(!_hasSR && text.length>160)
-      ? (text.match(/[^.!?]+[.!?]+\s*/g)||[text])
-      : [text];
-
-    var idx=0;
-    function next(){
-      if(idx>=chunks.length){_vBusy=false;return;}
-      var u=new SpeechSynthesisUtterance(chunks[idx++].trim());
-      u.rate=1.05; u.pitch=1.0; u.volume=1.0;
-      if(pick) u.voice=pick;
-      u.onend=next;
-      u.onerror=function(){_vBusy=false; vWisprSetStatus('💬','');};
-      _vSynth.speak(u);
-    }
-    function nextWrap(){
-      if(idx>=chunks.length){
-        _vBusy=false;
-        vWisprSetStatus('💬','');
-        /* re-focus bar so Wispr can type straight away */
-        var wi=document.getElementById('voiceWisprInp');
-        if(wi) setTimeout(function(){wi.focus();},150);
-        return;
-      }
-      var u=new SpeechSynthesisUtterance(chunks[idx++].trim());
-      u.rate=1.05; u.pitch=1.0; u.volume=1.0;
-      if(pick) u.voice=pick;
-      u.onend=nextWrap;
-      u.onerror=function(){_vBusy=false; vWisprSetStatus('💬','');};
-      _vSynth.speak(u);
-    }
-    /* patch next() to use nextWrap for end-of-speech refocus */
-    next=nextWrap;
-    next();
-    vLog('🔊 '+text.slice(0,72)+(text.length>72?'…':''));
+    if(wi){ var sk=vGetSTTKey(); wi.value=sk?sk.slice(0,14)+'…':''; }
   }
+};
 
-  /* ══════════════════════════════
-     LOG STRIP
-  ══════════════════════════════ */
-  function vLog(msg){
-    _vLog.unshift(msg);
-    if(_vLog.length>5)_vLog.pop();
-    var el=document.getElementById('voiceLog');
-    if(!el)return;
-    el.style.display='block';
-    el.innerHTML=_vLog.map(function(l){return'<div>'+l+'</div>';}).join('');
-  }
-
-  /* ══════════════════════════════
-     WISPR / DICTATION BAR
-  ══════════════════════════════ */
-  var _vWisprTimer=null;
-
-  function vShowText(){
-    var i=document.getElementById('voiceWisprInp');
-    if(i){ i.value=''; setTimeout(function(){i.focus();},80); }
-  }
-  function vHideText(){ /* bar is always visible */ }
-
-  function vWisprSetStatus(icon,mode){
-    var bar=document.getElementById('voiceWisprBar');
-    var st=document.getElementById('voiceWisprStatus');
-    if(st)st.textContent=icon;
-    if(bar){
-      bar.classList.remove('vw-active','vw-thinking');
-      if(mode==='typing')bar.classList.add('vw-active');
-      if(mode==='thinking')bar.classList.add('vw-thinking');
-    }
-  }
-
-  function vWisprExecute(){
-    var i=document.getElementById('voiceWisprInp');
-    if(!i)return;
-    var tx=(i.value||'').trim();
-    if(!tx){ vWisprSetStatus('💬',''); return; }
-    vLog('🗣 "'+tx.slice(0,48)+(tx.length>48?'…':'')+'"');
-    vWisprSetStatus('⏳','thinking');
-    i.value='';
-    if(_vSynth){ try{if(_vSynth.paused)_vSynth.resume();}catch(e){} _vSynth.cancel(); }
-    _vBusy=false;
-    setTimeout(function(){ vParse(tx); },80);
-  }
-
-  window.vSendTextCommand=function(){ vWisprExecute(); };
-
-  /* ══════════════════════════════
-     MEDIARECORDER  (Firefox mic)
-  ══════════════════════════════ */
-  function vStartMedia(){
-    if(!_hasMedia){ vShowText(); return; }
-    navigator.mediaDevices.getUserMedia({audio:true,video:false})
-    .then(function(stream){
-      _vMediaStream=stream;
-      _vMediaChunks=[];
-      /* Prefer WebM/Opus; Firefox also supports OGG/Opus */
-      var mime='audio/webm;codecs=opus';
-      if(!MediaRecorder.isTypeSupported(mime)) mime='audio/ogg;codecs=opus';
-      if(!MediaRecorder.isTypeSupported(mime)) mime='';
-      var rec=new MediaRecorder(stream, mime?{mimeType:mime}:{});
-      rec.ondataavailable=function(e){
-        if(e.data&&e.data.size>0) _vMediaChunks.push(e.data);
-      };
-      rec.onstop=function(){
-        stream.getTracks().forEach(function(t){t.stop();});
-        _vMediaStream=null;
-        vSetUI(false);
-        if(!_vMediaChunks.length) return;
-        var blob=new Blob(_vMediaChunks,{type:rec.mimeType||'audio/webm'});
-        vTranscribe(blob);
-      };
-      rec.onerror=function(){
-        vLog('⚠ Recorder error'); vSetUI(false); vShowText();
-      };
-      rec.start();
-      _vRecog=rec;
-      vSetUI(true);
-      vLog('🎙 Recording… release to send');
-    })
-    .catch(function(err){
-      vLog('⚠ Mic blocked: '+(err.name||'denied'));
-      vSpeak('Microphone access was denied. Click the mic to type instead.');
-      vShowText();
+/* ══════════════════════════════════════════════════════════════
+   DOM-CLICK ENGINE
+   vClick(el)  — fires a real MouseEvent on any element
+   vFind(sel)  — querySelector with fallbacks
+══════════════════════════════════════════════════════════════ */
+function vClick(el){
+  if(!el)return false;
+  try{
+    el.scrollIntoView({block:'center',behavior:'instant'});
+    ['mousedown','mouseup','click'].forEach(function(ev){
+      el.dispatchEvent(new MouseEvent(ev,{bubbles:true,cancelable:true,view:window}));
     });
-  }
+    return true;
+  }catch(e){ return false; }
+}
+function vSet(el,val){
+  if(!el)return false;
+  try{
+    el.focus();
+    var setter=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
+    setter.call(el,val);
+    el.dispatchEvent(new Event('input',{bubbles:true}));
+    el.dispatchEvent(new Event('change',{bubbles:true}));
+    return true;
+  }catch(e){ el.value=val; el.dispatchEvent(new Event('input',{bubbles:true})); return true; }
+}
 
-  function vStopMedia(){
-    if(_vRecog && typeof _vRecog.stop==='function'){
-      try{ if(_vRecog.state!=='inactive') _vRecog.stop(); }catch(e){}
-    }
-    if(_vMediaStream){
-      _vMediaStream.getTracks().forEach(function(t){t.stop();});
-      _vMediaStream=null;
-    }
-    vSetUI(false);
-  }
-
-  /* ══════════════════════════════
-     TRANSCRIPTION  (Groq ▸ OpenAI ▸ text)
-  ══════════════════════════════ */
-  function vTranscribe(blob){
-    var key=vGetSTTKey();
-    var url=vSTTEndpoint(key);
-
-    if(!key||!url){
-      vLog('ℹ No STT key — add a free Groq key in ⚙');
-      vSpeak('Add a Groq or OpenAI key in voice settings to use the microphone.');
-      vShowText();
-      return;
-    }
-
-    var provider=key.startsWith('gsk_')?'Groq':'OpenAI';
-    vLog('⏳ Transcribing via '+provider+'…');
-    if(_vSynth)_vSynth.cancel();
-    vSpeak('One moment…');
-
-    var ext=blob.type.includes('ogg')?'ogg':'webm';
-    var fd=new FormData();
-    fd.append('file', new File([blob],'audio.'+ext,{type:blob.type}));
-    fd.append('model', key.startsWith('gsk_')?'whisper-large-v3-turbo':'whisper-1');
-    fd.append('language','en');
-
-    fetch(url,{
-      method:'POST',
-      headers:{'Authorization':'Bearer '+key},
-      body:fd
-    })
-    .then(function(r){ return r.json(); })
-    .then(function(d){
-      var tx=(d.text||'').trim();
-      if(tx){
-        vLog('🎙 "'+tx.slice(0,55)+(tx.length>55?'…':'')+'"');
-        vParse(tx);
-      } else {
-        vLog('⚠ No speech detected');
-        vShowText();
-      }
-    })
-    .catch(function(){
-      vLog('⚠ STT request failed');
-      vShowText();
-    });
-  }
-
-  /* ══════════════════════════════
-     COMMAND PARSER  (unchanged)
-  ══════════════════════════════ */
-  function vParse(text){
-    var t=text.toLowerCase().trim();
-    /* strip natural-language filler */
-    t=t.replace(/^(okay|ok|hey|tram|hi|hello|uh|um|so|well|please|can you|could you|tell me|show me|give me|i want to|now|go ahead and|let's|lets)\s+/,'').trim();
-
-    vLog('🗣 '+text.slice(0,50)+(text.length>50?'…':''));
-
-    /* ═══════════════════════════════════════════════
-       CHART GRID ACTIONS
-    ═══════════════════════════════════════════════ */
-
-    /* SELECT top N buy signals */
-    var selMatch=t.match(/select\s+(?:top\s+|first\s+)?(\d+|all)\s*(buy|sell|signal)?/);
-    if(selMatch||/select all/.test(t)){
-      var n=selMatch&&selMatch[1]!=='all'?parseInt(selMatch[1]):25;
-      var side=(selMatch&&selMatch[2]&&selMatch[2].startsWith('s'))?'sell':'buy';
-      var list=(window.allSignals||[])
-        .filter(function(s){return side==='buy'?s.signal.charAt(0)==='B':s.signal.charAt(0)==='S';})
-        .sort(function(a,b){return b.score-a.score;}).slice(0,n);
-      if(!list.length)return vSpeak('No signals loaded yet. Import your CSV first.');
-      /* clear existing selection */
-      try{
-        document.querySelectorAll('.mco-cb').forEach(function(cb){
-          cb.checked=false;
-          var sym=cb.id.replace('mcb_','');
-          if(typeof _mcoSel!=='undefined') delete _mcoSel[sym];
-        });
-        var ba=document.getElementById('cbBuyAll');if(ba)ba.checked=false;
-        var sa=document.getElementById('cbSellAll');if(sa)sa.checked=false;
-      }catch(e){}
-      /* select the list */
-      var added=0;
-      list.forEach(function(sig){
-        try{
-          var cb=document.getElementById('mcb_'+sig.symbol);
-          if(cb&&typeof mcoToggle==='function'){
-            cb.checked=true;
-            mcoToggle(cb,sig.symbol,sig.signal,sig.tp,sig.sl,sig.score,sig.cmp);
-            added++;
-          } else if(typeof _mcoSel!=='undefined'){
-            _mcoSel[sig.symbol]={symbol:sig.symbol,signal:sig.signal,tp:sig.tp,sl:sig.sl,score:sig.score,cmp:sig.cmp};
-            added++;
-          }
-        }catch(e){}
-      });
-      _vLastList=list;
-      return vSpeak(added+' '+side+' signals selected. Say open charts to load them.');
-    }
-
-    /* OPEN CHARTS (render the grid) */
-    if(/open (all |the )?charts?|load (all |the )?charts?|show (all |the )?charts?|launch charts?|render charts?/.test(t)){
-      try{
-        if(typeof mcoOpen==='function'){ mcoOpen(); return vSpeak('Opening charts now.'); }
-      }catch(e){}
-      return vSpeak('Chart function not available.');
-    }
-
-    /* OPEN / ZOOM specific symbol or number from last list */
-    var openMatch=t.match(/(?:open|zoom|chart|show chart for?|zoom into?)\s+(?:number\s+|no\.?\s*)?([1-5]|[a-z0-9&]{2,12})/);
-    if(openMatch||(/ ^open$|^zoom$/.test(t)&&_vLastList.length)){
-      var target=openMatch?openMatch[1].trim():null;
-      var sigToOpen=null;
-      if(!target||target==='1'||/^first|^top/.test(target)){
-        sigToOpen=_vLastList[0];
-      } else if(/^\d$/.test(target)){
-        sigToOpen=_vLastList[parseInt(target)-1]||_vLastList[0];
-      } else {
-        /* symbol name */
-        var symUp=target.toUpperCase();
-        sigToOpen=(window.allSignals||[]).find(function(s){return s.symbol===symUp;})
-                  ||_vLastList.find(function(s){return s.symbol===symUp;});
-      }
-      if(sigToOpen){
-        if(window.vOpenChart&&window.vOpenChart(sigToOpen)){
-          return vSpeak('Zooming '+sigToOpen.symbol+'.');
-        }
-      }
-      if(!target&&_vLastList.length){
-        sigToOpen=_vLastList[0];
-        if(window.vOpenChart&&window.vOpenChart(sigToOpen)) return vSpeak('Zooming '+sigToOpen.symbol+'.');
-      }
-      return vSpeak('Say select buy signals first, then open charts, then zoom a symbol.');
-    }
-
-    /* BACK / CLOSE zoom */
-    if(/back|close chart|close zoom|go back|exit chart|back to grid/.test(t)){
-      try{if(typeof mcoZoomClose==='function')mcoZoomClose();}catch(e){}
-      return vSpeak('Back to grid.');
-    }
-
-    /* NEXT chart */
-    if(/next|next chart|next stock/.test(t)){
-      var cur=typeof _zoomSym!=='undefined'?_zoomSym:null;
-      var idx3=cur?_vLastList.findIndex(function(s){return s.symbol===cur;}): -1;
-      var nxt=_vLastList[idx3+1];
-      if(nxt){
-        if(window.vOpenChart&&window.vOpenChart(nxt)) return vSpeak(nxt.symbol+'.');
-      }
-      return vSpeak('No more charts in the list.');
-    }
-
-    /* PREVIOUS chart */
-    if(/previous|prev chart|go back one|last chart/.test(t)){
-      var cur2=typeof _zoomSym!=='undefined'?_zoomSym:null;
-      var idx4=cur2?_vLastList.findIndex(function(s){return s.symbol===cur2;}): 1;
-      var prv=_vLastList[idx4-1];
-      if(prv){
-        if(window.vOpenChart&&window.vOpenChart(prv)) return vSpeak(prv.symbol+'.');
-      }
-      return vSpeak('Already at the first chart.');
-    }
-
-    /* ═══════════════════════════════════════════════
-       ORDER ACTIONS
-    ═══════════════════════════════════════════════ */
-
-    /* INITIATE BUY / PLACE BUY */
-    if(/(?:initiate|place|execute|put|fire|trigger|do)\s+(?:a\s+)?buy|buy order|buy this|buy it|go long/.test(t)){
-      try{
-        var zSym=typeof _zoomSym!=='undefined'?_zoomSym:null;
-        var zObj=typeof _zoomSigObj!=='undefined'?_zoomSigObj:null;
-        if(!zSym&&_vLastList.length){zSym=_vLastList[0].symbol;zObj=_vLastList[0];}
-        if(zSym&&zObj&&typeof showOrderModal==='function'){
-          showOrderModal(zSym,'BUY',zObj.cmp||0,zObj.tp||0,zObj.sl||0);
-          return vSpeak('Buy order window open for '+zSym+'. Check quantity and price, then confirm.');
-        }
-      }catch(e){}
-      return vSpeak('Please zoom into a chart first, then say initiate buy.');
-    }
-
-    /* INITIATE SELL / PLACE SELL */
-    if(/(?:initiate|place|execute|put|fire|trigger|do)\s+(?:a\s+)?sell|sell order|sell this|sell it|go short/.test(t)){
-      try{
-        var zSym2=typeof _zoomSym!=='undefined'?_zoomSym:null;
-        var zObj2=typeof _zoomSigObj!=='undefined'?_zoomSigObj:null;
-        if(!zSym2&&_vLastList.length){zSym2=_vLastList[0].symbol;zObj2=_vLastList[0];}
-        if(zSym2&&zObj2&&typeof showOrderModal==='function'){
-          showOrderModal(zSym2,'SELL',zObj2.cmp||0,zObj2.tp||0,zObj2.sl||0);
-          return vSpeak('Sell order window open for '+zSym2+'. Check quantity and price, then confirm.');
-        }
-      }catch(e){}
-      return vSpeak('Please zoom into a chart first, then say initiate sell.');
-    }
-
-    /* CONFIRM / PLACE ORDER (click the confirm button) */
-    if(/confirm order|place order|confirm|execute order|submit order|yes.*order|proceed/.test(t)){
-      try{
-        var confirmBtn=document.getElementById('omConfirmBtn');
-        if(confirmBtn&&!confirmBtn.disabled){
-          confirmBtn.click();
-          return vSpeak('Order placed.');
-        }
-      }catch(e){}
-      return vSpeak('No order window is open to confirm.');
-    }
-
-    /* CANCEL / CLOSE order modal */
-    if(/cancel order|close order|dismiss|cancel/.test(t)){
-      try{
-        if(typeof closeOrderModal==='function'){closeOrderModal();return vSpeak('Order cancelled.');}
-      }catch(e){}
-    }
-
-    /* SET QUANTITY */
-    var qtyMatch=t.match(/(?:set|change|make it|quantity|qty)\s+(?:to\s+)?(\d+)/);
-    if(qtyMatch){
-      var qtyInp=document.getElementById('omQty');
-      if(qtyInp){
-        qtyInp.value=qtyMatch[1];
-        if(typeof updateOmTotal==='function')updateOmTotal();
-        return vSpeak('Quantity set to '+qtyMatch[1]+'.');
-      }
-      return vSpeak('Order window is not open.');
-    }
-
-    /* ═══════════════════════════════════════════════
-       PAUSE / RESUME / REFRESH
-    ═══════════════════════════════════════════════ */
-    if(/pause|freeze|stop refresh/.test(t)){
-      try{if(typeof mcoPauseToggle==='function'&&!_mcoPaused){mcoPauseToggle();return vSpeak('Charts paused.');}}catch(e){}
-      return vSpeak('Already paused.');
-    }
-    if(/resume|unpause|start refresh|unfreeze/.test(t)){
-      try{if(typeof mcoPauseToggle==='function'&&_mcoPaused){mcoPauseToggle();return vSpeak('Charts resumed.');}}catch(e){}
-      return vSpeak('Charts are already running.');
-    }
-    if(/refresh|update|reload/.test(t)){
-      try{if(typeof mcoTick==='function'){mcoTick();return vSpeak('Refreshing.');}}catch(e){}
-    }
-
-    /* ═══════════════════════════════════════════════
-       MARKET & SIGNAL INFO
-    ═══════════════════════════════════════════════ */
-
-    /* BUY signals list */
-    if(/buy|long|bullish/.test(t)&&!/sell/.test(t)){
-      var buys=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='B';})
-        .sort(function(a,b){return b.score-a.score;}).slice(0,5);
-      if(!buys.length)return vSpeak('No buy signals. Import your CSV first.');
-      _vLastList=buys;
-      var bm=buys.length+' buys. ';
-      buys.forEach(function(s,i){bm+=(i+1)+'. '+s.symbol+' '+s.score+'. ';});
-      bm+='Say select '+buys.length+' buy, or open charts, or zoom one.';
-      return vSpeak(bm);
-    }
-
-    /* SELL signals list */
-    if(/sell|short|bearish/.test(t)){
-      var sells=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='S';})
-        .sort(function(a,b){return b.score-a.score;}).slice(0,5);
-      if(!sells.length)return vSpeak('No sell signals.');
-      _vLastList=sells;
-      var sm=sells.length+' sells. ';
-      sells.forEach(function(s,i){sm+=(i+1)+'. '+s.symbol+' '+s.score+'. ';});
-      sm+='Say select '+sells.length+' sell, or open charts, or zoom one.';
-      return vSpeak(sm);
-    }
-
-    /* MARKET / REGIME */
-    if(/market|regime|mood|outlook|nifty|sensex|indices|today|overall/.test(t)){
-      var rMap={full:'Bull market. All green.',bear:'Bear. All red. Stay cautious.',
-                mixed:'Mixed. Indices disagree.',caution:'Caution. Weak regime.'};
-      var r=window.overallRegime||'unknown';
-      var bc=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='B';}).length;
-      var sc=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='S';}).length;
-      return vSpeak((rMap[r]||r)+' '+bc+' buys, '+sc+' sells.');
-    }
-
-    /* POSITIONS / P&L */
-    if(/position|holding|pnl|profit|loss|portfolio|how.*doing|money/.test(t)){
-      var pos=(window._brokerData&&window._brokerData.positions)||[];
-      if(!pos.length)return vSpeak('No open positions. Connect Kite first.');
-      var tot=pos.reduce(function(s,p){return s+(p.pnl||0);},0);
-      var pm=pos.length+' positions. Total '+(tot>=0?'up ':'down ')+Math.abs(Math.round(tot)).toLocaleString('en-IN')+' rupees. ';
-      pos.slice(0,3).forEach(function(p){pm+=p.tradingsymbol+' '+(p.pnl>=0?'up':'down')+' '+Math.abs(Math.round(p.pnl))+'. ';});
-      return vSpeak(pm);
-    }
-
-    /* BEST pick */
-    if(/best|strongest|top pick|number one|highest/.test(t)){
-      var best=(window.allSignals||[]).sort(function(a,b){return b.score-a.score;})[0];
-      if(!best)return vSpeak('No signals loaded.');
-      _vLastList=[best];
-      return vSpeak('Best: '+best.symbol+', score '+best.score
-        +', entry '+(+best.cmp).toFixed(0)+', target '+(+best.tp).toFixed(0)
-        +'. Say zoom or open to chart it.');
-    }
-
-    /* SPECIFIC SYMBOL */
-    var allSyms=Object.keys(window.allStockData||{});
-    for(var i=0;i<allSyms.length;i++){
-      if(new RegExp('\\b'+allSyms[i].toLowerCase()+'\\b').test(t)){
-        var sig=(window.allSignals||[]).find(function(x){return x.symbol===allSyms[i];});
-        if(sig){
-          _vLastList=[sig];
-          return vSpeak(allSyms[i]+': '+(sig.signal.charAt(0)==='B'?'buy':'sell')
-            +', score '+sig.score+', entry '+(+sig.cmp).toFixed(0)
-            +', target '+(+sig.tp).toFixed(0)+'. Say zoom to chart it.');
-        }
-        return vSpeak(allSyms[i]+' loaded but no signal today.');
-      }
-    }
-
-    /* HELP */
-    if(/help|what can|commands|how do i/.test(t)){
-      return vSpeak('Say: buy signals, sell signals, market, select 10 buy, open charts, zoom FDC, next, previous, initiate buy, set quantity 50, confirm order, positions, refresh, pause, or resume.');
-    }
-
-    /* FALLBACK */
-    vAskClaude(text);
-  }
-
-  /* ══════════════════════════════
-     CLAUDE API FALLBACK
-  ══════════════════════════════ */
-  function vAskClaude(text){
-    var key=vGetAnthKey();
-    if(!key){
-      return vSpeak('I heard: '+text.slice(0,50)+'. Try saying: buy signals, sell signals, market outlook, positions, or best signal.');
-    }
-    vLog('🤖 Asking Claude…');
-    if(_vSynth)_vSynth.cancel();
-    vSpeak('One moment…');
-    var buys=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='B';})
-             .sort(function(a,b){return b.score-a.score;}).slice(0,8)
-             .map(function(s){return s.symbol+'('+s.score+')';}).join(', ');
-    var sells=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='S';})
-              .sort(function(a,b){return b.score-a.score;}).slice(0,5)
-              .map(function(s){return s.symbol+'('+s.score+')';}).join(', ');
-    var sysP='You are TRAM, a concise voice assistant for an NSE intraday stock trading dashboard. '
-      +'Live state — Regime: '+(window.overallRegime||'unknown')+'. '
-      +'Top buys: '+(buys||'none')+'. Top sells: '+(sells||'none')+'. '
-      +'Respond in 1-2 short spoken sentences only. No markdown, no bullet points, no rupee symbols (say rupees instead). Keep it under 45 words.';
-    fetch('https://api.anthropic.com/v1/messages',{
-      method:'POST',
-      headers:{
-        'Content-Type':'application/json',
-        'x-api-key':key,
-        'anthropic-version':'2023-06-01',
-        'anthropic-dangerous-client-side-key':'true'
-      },
-      body:JSON.stringify({
-        model:'claude-sonnet-4-20250514',
-        max_tokens:120,
-        system:sysP,
-        messages:[{role:'user',content:text}]
-      })
-    })
-    .then(function(r){return r.json();})
-    .then(function(d){
-      if(_vSynth)_vSynth.cancel();
-      var reply=d.content&&d.content[0]&&d.content[0].text;
-      vSpeak(reply||'Sorry, no response received.');
-    })
-    .catch(function(){
-      if(_vSynth)_vSynth.cancel();
-      vSpeak('Could not reach AI. Check your connection or API key in voice settings.');
-    });
-  }
-
-  /* ══════════════════════════════
-     CHROME/EDGE: WEB SPEECH API
-  ══════════════════════════════ */
-  function vSetupRecog(){
-    var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-    if(!SR)return null;
-    var r=new SR();
-    r.continuous=false; r.interimResults=false; r.lang='en-IN';
-    r.onresult=function(e){
-      var tx=e.results[0][0].transcript||'';
-      vLog('🎙 "'+tx.slice(0,55)+(tx.length>55?'…':'')+'"');
-      vParse(tx);
-    };
-    r.onerror=function(e){ if(e.error!=='no-speech') vLog('⚠ Mic: '+e.error); vSetUI(false); };
-    r.onend=function(){ vSetUI(false); };
-    return r;
-  }
-
-  /* ══════════════════════════════
-     UI HELPERS
-  ══════════════════════════════ */
-  function vSetUI(on){
-    _vOn=on;
-    var btn=document.getElementById('voiceMicBtn');
-    var ring=document.getElementById('voiceRing');
-    if(!btn)return;
-    if(on){
-      btn.style.background='var(--bear)'; btn.innerHTML='⏹';
-      if(ring) ring.style.animationPlayState='running';
-    } else {
-      btn.style.background='var(--amber)'; btn.innerHTML='🎙';
-      if(ring) ring.style.animationPlayState='paused';
-    }
-  }
-
-  /* ══════════════════════════════
-     START / STOP
-     Firefox UX:
-       quick click  (<500ms) → text input
-       hold (≥500ms) → MediaRecorder → Whisper/Groq
-  ══════════════════════════════ */
-  function vStart(){
-    /* ── ALWAYS silence TTS the moment user presses the button ── */
-    if(_vSynth){ try{if(_vSynth.paused)_vSynth.resume();}catch(e){} _vSynth.cancel(); }
-    _vBusy=false;
-    _vHoldStart=Date.now();
-
-    if(!_hasSR){
-      var sttKey=vGetSTTKey();
-      if(sttKey&&_hasMedia){
-        vStartMedia();
-      }
-      return;
-    }
-
-    /* Chrome/Edge */
-    if(!_vRecog) _vRecog=vSetupRecog();
-    if(!_vRecog){ vLog('⚠ Mic not available'); return; }
-    try{ _vRecog.start(); vSetUI(true); vLog('🎙 Listening…'); }catch(e){}
-  }
-
-  function vStop(){
-    if(!_hasSR){
-      var sttKey=vGetSTTKey();
-      if(sttKey&&_hasMedia){
-        vStopMedia();
-      } else {
-        vShowText();
-      }
-      return;
-    }
-    /* Chrome/Edge */
-    if(_vRecog&&_vOn){ try{ _vRecog.stop(); }catch(e){} }
-    vSetUI(false);
-  }
-
-  /* ══════════════════════════════
-     INIT
-  ══════════════════════════════ */
-  function vInit(){
-    if(_vSynth&&_vSynth.onvoiceschanged!==undefined)
-      _vSynth.onvoiceschanged=function(){ _vSynth.getVoices(); };
-    if(_vSynth) _vSynth.getVoices();
-
-    var btn=document.getElementById('voiceMicBtn');
-    if(!btn) return;
-
-    var wrow=document.getElementById('voiceWhisperRow');
-    var lbl =document.getElementById('voiceFFLabel');
-
-    if(!_hasSR){
-      /* Firefox: always fully visible and active */
-      btn.style.opacity='1';
-      if(wrow) wrow.style.display='block';
-      if(lbl){
-        var sttKey=vGetSTTKey();
-        var mode=sttKey ? (sttKey.startsWith('gsk_')?'Groq':'OpenAI')+' mic' : 'text input';
-        lbl.textContent='Firefox · '+mode;
-        lbl.style.display='block';
-      }
-      btn.title='Hold to record (Groq/OpenAI key)\nClick for text input';
-    } else {
-      if(wrow) wrow.style.display='none';
-      if(lbl)  lbl.style.display='none';
-    }
-
-    /* ── Mouse events ── */
-    btn.addEventListener('mousedown',function(e){ e.preventDefault(); vStart(); });
-    btn.addEventListener('mouseup',  function(){ setTimeout(vStop,_hasSR?450:0); });
-    btn.addEventListener('mouseleave',function(){ if(_vOn) vStop(); });
-
-    /* ── Touch events ── */
-    btn.addEventListener('touchstart',function(e){ e.preventDefault(); vStart(); },{passive:false});
-    btn.addEventListener('touchend',  function(){ setTimeout(vStop,_hasSR?450:0); });
-
-    /* ── Wispr bar: auto-execute 1.5s after last keystroke ── */
-    var wi=document.getElementById('voiceWisprInp');
-    if(wi){
-      wi.addEventListener('input',function(){
-        vWisprSetStatus('✍','typing');
-        clearTimeout(_vWisprTimer);
-        _vWisprTimer=setTimeout(function(){
-          if((wi.value||'').trim()) vWisprExecute();
-          else vWisprSetStatus('💬','');
-        },1500);
-      });
-      wi.addEventListener('keydown',function(e){
-        if(e.key==='Enter'){ e.preventDefault(); clearTimeout(_vWisprTimer); vWisprExecute(); }
-        if(e.key==='Escape'){ wi.value=''; vWisprSetStatus('💬',''); }
-      });
-      /* keep focus on the bar after TTS finishes */
-      wi.addEventListener('blur',function(){
-        setTimeout(function(){
-          var active=document.activeElement;
-          var tag=active?active.tagName:'';
-          if(tag!=='INPUT'&&tag!=='TEXTAREA'&&tag!=='BUTTON') wi.focus();
-        },300);
-      });
-      /* initial focus */
-      setTimeout(function(){wi.focus();},600);
-    }
-
-    /* ── Greeting ── */
-    setTimeout(function(){
+/* ══════════════════════════════════════════════════════════════
+   TTS  — Firefox-safe, sentence-split, re-focus bar after
+══════════════════════════════════════════════════════════════ */
+function vSpeak(text){
+  if(!text||!_vSynth)return;
+  _vBusy=true;
+  vWisprSetStatus('🔊','thinking');
+  try{ if(_vSynth.paused)_vSynth.resume(); }catch(e){}
+  _vSynth.cancel();
+  var vv=_vSynth.getVoices();
+  var pick=vv.find(function(v){return v.lang==='en-IN';})
+           ||vv.find(function(v){return v.lang==='en-GB';})
+           ||vv.find(function(v){return v.lang.startsWith('en');});
+  var chunks=(!_hasSR&&text.length>160)
+    ?(text.match(/[^.!?]+[.!?]+\s*/g)||[text]):[text];
+  var idx=0;
+  function next(){
+    if(idx>=chunks.length){
+      _vBusy=false;
       vWisprSetStatus('💬','');
-      vSpeak('TRAM ready. Speak via Wispr or type in the bar below.');
-      vLog('ℹ Wispr bar active · speak → auto-executes in 1.5s · or press Enter');
-    },1500);
+      var wi=document.getElementById('voiceWisprInp');
+      if(wi) setTimeout(function(){wi.focus();},150);
+      return;
+    }
+    var u=new SpeechSynthesisUtterance(chunks[idx++].trim());
+    u.rate=1.05; u.pitch=1.0; u.volume=1.0;
+    if(pick) u.voice=pick;
+    u.onend=next;
+    u.onerror=function(){_vBusy=false; vWisprSetStatus('💬','');};
+    _vSynth.speak(u);
+  }
+  next();
+  vLog('🔊 '+text.slice(0,60)+(text.length>60?'…':''));
+}
+
+/* ── Log strip ──────────────────────────────────────────────── */
+function vLog(msg){
+  _vLog.unshift(msg); if(_vLog.length>5)_vLog.pop();
+  var el=document.getElementById('voiceLog');
+  if(!el)return;
+  el.style.display='block';
+  el.innerHTML=_vLog.map(function(l){return'<div>'+l+'</div>';}).join('');
+}
+
+/* ── Wispr bar status ───────────────────────────────────────── */
+function vWisprSetStatus(icon,mode){
+  var bar=document.getElementById('voiceWisprBar');
+  var st =document.getElementById('voiceWisprStatus');
+  if(st) st.textContent=icon;
+  if(bar){
+    bar.classList.remove('vw-active','vw-thinking');
+    if(mode==='typing')  bar.classList.add('vw-active');
+    if(mode==='thinking')bar.classList.add('vw-thinking');
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   EXECUTE  — DOM-click command handler
+   Every branch clicks/sets a real element. Nothing is assumed
+   to be in scope. Falls back to Anthropic AI if no match.
+══════════════════════════════════════════════════════════════ */
+function vExec(text){
+  var t=text.toLowerCase().trim()
+    .replace(/^(okay|ok|hey|tram|hi|hello|uh|um|so|well|please|can you|could you|now|go ahead|let's|lets|i want to)\s+/,'')
+    .trim();
+
+  vLog('🗣 '+text.slice(0,50)+(text.length>50?'…':''));
+
+  /* ── SELECT top N buy/sell ─────────────────────────────────── */
+  var selM=t.match(/select\s+(?:top\s+|first\s+)?(\d+|all)\s*(buy|sell)?/);
+  if(selM||/^select all/.test(t)){
+    var n   = (selM&&selM[1]&&selM[1]!=='all') ? parseInt(selM[1]) : 25;
+    var side= (selM&&selM[2]&&selM[2].startsWith('s')) ? 'sell' : 'buy';
+
+    /* first deselect all by unchecking select-all */
+    var clearCb=document.getElementById(side==='buy'?'cbBuyAll':'cbSellAll');
+    if(clearCb&&clearCb.checked){ clearCb.checked=false; vClick(clearCb); }
+
+    /* get checkboxes from the correct table */
+    var tbl=document.getElementById(side==='buy'?'top25BuyTbl':'top25SellTbl');
+    var cbs=tbl?tbl.querySelectorAll('.mco-cb'):document.querySelectorAll('.mco-cb');
+    var added=0;
+    cbs.forEach(function(cb){
+      if(added>=n){ if(cb.checked){cb.checked=false;vClick(cb);} return; }
+      if(!cb.checked){ cb.checked=true; vClick(cb); }
+      added++;
+    });
+    return vSpeak(added+' '+side+' signals selected. Say open charts.');
   }
 
-  if(document.readyState==='loading'){
-    document.addEventListener('DOMContentLoaded',vInit);
-  } else {
-    vInit();
+  /* ── OPEN CHARTS ───────────────────────────────────────────── */
+  if(/open (all |the )?charts?|load charts?|show charts?|launch charts?/.test(t)){
+    var openBtn=document.querySelector('.csb-open');
+    if(vClick(openBtn)) return vSpeak('Opening charts.');
+    return vSpeak('Open charts button not found. Select signals first.');
   }
+
+  /* ── ZOOM / OPEN specific symbol or number ─────────────────── */
+  var zoomM=t.match(/(?:zoom|open|chart)\s+(?:into?\s+|number\s+|no\.?\s*)?([1-5]|[a-z0-9&]{2,12})/);
+  var justZoom=/^(?:zoom|open)$/.test(t);
+  if(zoomM||justZoom){
+    var target=zoomM?zoomM[1].trim():null;
+    var sigTo=null;
+    if(!target||/^1$|first|top/.test(target)){
+      sigTo=_vLastList[0];
+    } else if(/^[2-5]$/.test(target)){
+      sigTo=_vLastList[parseInt(target)-1];
+    } else if(target){
+      var up=target.toUpperCase();
+      var allSig=window.allSignals||[];
+      sigTo=allSig.find(function(s){return s.symbol===up;})
+            ||_vLastList.find(function(s){return s.symbol===up;});
+    }
+    if(sigTo){
+      /* click the zoom button in the grid cell if visible,
+         otherwise inject into _mcoSel and click the cell's zoom btn */
+      var zBtn=document.querySelector('#cell_'+sigTo.symbol+' [onclick*="mcoZoom"]');
+      if(!zBtn){
+        /* try to find any zoom button in a cell containing this symbol */
+        var allCells=document.querySelectorAll('.mco-cell');
+        for(var ci=0;ci<allCells.length;ci++){
+          if(allCells[ci].id&&allCells[ci].id.indexOf(sigTo.symbol)>-1){
+            zBtn=allCells[ci].querySelector('[onclick*="mcoZoom"]');
+            break;
+          }
+        }
+      }
+      if(zBtn&&vClick(zBtn)) return vSpeak('Zooming '+sigTo.symbol+'.');
+
+      /* chart not in grid yet — open via direct mcoZoomOpen if available */
+      try{
+        if(typeof _mcoSel!=='undefined') _mcoSel[sigTo.symbol]=sigTo;
+        if(typeof mcoZoomOpen==='function'){
+          mcoZoomOpen(sigTo.symbol,'');
+          return vSpeak('Zooming '+sigTo.symbol+'.');
+        }
+      }catch(e){}
+      return vSpeak(sigTo.symbol+' not in chart grid. Say open charts first, then zoom.');
+    }
+    return vSpeak('Which symbol? Say zoom FDC or zoom 2.');
+  }
+
+  /* ── NEXT chart ─────────────────────────────────────────────── */
+  if(/\bnext\b/.test(t)){
+    var curSym=null;
+    try{ curSym=typeof _zoomSym!=='undefined'?_zoomSym:null; }catch(e){}
+    var ci2=curSym?_vLastList.findIndex(function(s){return s.symbol===curSym;}):-1;
+    var nxt=_vLastList[ci2+1];
+    if(nxt){
+      try{
+        if(typeof _mcoSel!=='undefined') _mcoSel[nxt.symbol]=nxt;
+        if(typeof mcoZoomOpen==='function'){ mcoZoomOpen(nxt.symbol,''); return vSpeak(nxt.symbol+'.'); }
+      }catch(e){}
+    }
+    return vSpeak('No more charts.');
+  }
+
+  /* ── PREVIOUS chart ─────────────────────────────────────────── */
+  if(/\bprevious\b|\bprev\b|\bback one\b/.test(t)){
+    var curSym2=null;
+    try{ curSym2=typeof _zoomSym!=='undefined'?_zoomSym:null; }catch(e){}
+    var ci3=curSym2?_vLastList.findIndex(function(s){return s.symbol===curSym2;}):1;
+    var prv=_vLastList[ci3-1];
+    if(prv){
+      try{
+        if(typeof _mcoSel!=='undefined') _mcoSel[prv.symbol]=prv;
+        if(typeof mcoZoomOpen==='function'){ mcoZoomOpen(prv.symbol,''); return vSpeak(prv.symbol+'.'); }
+      }catch(e){}
+    }
+    return vSpeak('Already at the first chart.');
+  }
+
+  /* ── BACK to grid ───────────────────────────────────────────── */
+  if(/back|close chart|close zoom|go back|exit chart|back to grid/.test(t)){
+    var backBtn=document.getElementById('mcoZoomBack');
+    if(vClick(backBtn)) return vSpeak('Back to grid.');
+    try{ if(typeof mcoZoomClose==='function'){mcoZoomClose();return vSpeak('Back to grid.');} }catch(e){}
+    return vSpeak('Not in zoom view.');
+  }
+
+  /* ── INITIATE BUY ───────────────────────────────────────────── */
+  if(/(?:initiate|place|execute|put|fire|trigger)\s+(?:a\s+)?buy|buy order|buy this|buy it|go long/.test(t)){
+    /* try clicking the visible BUY button in the zoom header */
+    var buyBtn=document.getElementById('mcoZoomBuyBtn');
+    if(buyBtn&&buyBtn.style.display!=='none'&&vClick(buyBtn))
+      return vSpeak('Buy order window open. Check quantity, then say confirm.');
+    /* fallback — open modal directly if we have a last signal */
+    var ls=_vLastList[0];
+    if(ls){
+      try{
+        if(typeof showOrderModal==='function'){
+          showOrderModal(ls.symbol,'BUY',ls.cmp||0,ls.tp||0,ls.sl||0);
+          return vSpeak('Buy order for '+ls.symbol+'. Say confirm to place it.');
+        }
+      }catch(e){}
+    }
+    return vSpeak('Zoom into a chart first, then say initiate buy.');
+  }
+
+  /* ── INITIATE SELL ──────────────────────────────────────────── */
+  if(/(?:initiate|place|execute|put|fire|trigger)\s+(?:a\s+)?sell|sell order|sell this|sell it|go short/.test(t)){
+    var sellBtn=document.getElementById('mcoZoomSellBtn');
+    if(sellBtn&&sellBtn.style.display!=='none'&&vClick(sellBtn))
+      return vSpeak('Sell order window open. Check quantity, then say confirm.');
+    var ls2=_vLastList[0];
+    if(ls2){
+      try{
+        if(typeof showOrderModal==='function'){
+          showOrderModal(ls2.symbol,'SELL',ls2.cmp||0,ls2.tp||0,ls2.sl||0);
+          return vSpeak('Sell order for '+ls2.symbol+'. Say confirm to place it.');
+        }
+      }catch(e){}
+    }
+    return vSpeak('Zoom into a chart first, then say initiate sell.');
+  }
+
+  /* ── SET QUANTITY ───────────────────────────────────────────── */
+  var qtyM=t.match(/(?:set|change|quantity|qty|make it|shares?)\s+(?:to\s+)?(\d+)/);
+  if(qtyM){
+    var qInp=document.getElementById('omQty');
+    if(qInp&&vSet(qInp,qtyM[1])) return vSpeak('Quantity '+qtyM[1]+'.');
+    return vSpeak('Order window is not open.');
+  }
+
+  /* ── SET INVESTMENT AMOUNT ──────────────────────────────────── */
+  var invM=t.match(/(?:invest|amount|value|worth|put in)\s+(?:rs\.?\s*|rupees?\s*)?(\d[\d,]*)/);
+  if(invM){
+    var amt=invM[1].replace(/,/g,'');
+    var invInp=document.getElementById('omInvest');
+    if(invInp&&vSet(invInp,amt)){
+      /* trigger qty recalc */
+      try{ if(typeof calcQtyFromInvestment==='function')calcQtyFromInvestment(); }catch(e){}
+      return vSpeak('Investment set to '+amt+' rupees.');
+    }
+    return vSpeak('Order window is not open.');
+  }
+
+  /* ── CONFIRM ORDER ──────────────────────────────────────────── */
+  if(/confirm|place order|execute order|submit|proceed|yes.*order/.test(t)){
+    var confirmBtn=document.getElementById('omConfirmBtn');
+    if(confirmBtn&&!confirmBtn.disabled&&vClick(confirmBtn))
+      return vSpeak('Order placed.');
+    return vSpeak('No order to confirm, or order already placed.');
+  }
+
+  /* ── CANCEL ORDER ───────────────────────────────────────────── */
+  if(/cancel|close order|dismiss order|no.*order/.test(t)){
+    var cancelBtn=document.querySelector('.btn-order-cancel');
+    if(vClick(cancelBtn)) return vSpeak('Order cancelled.');
+    try{ if(typeof closeOrderModal==='function'){closeOrderModal();return vSpeak('Order cancelled.');} }catch(e){}
+  }
+
+  /* ── PAUSE ──────────────────────────────────────────────────── */
+  if(/pause|freeze|stop refresh/.test(t)){
+    var pauseBtn=document.getElementById('mcoPauseBtn');
+    if(pauseBtn&&pauseBtn.textContent.includes('Pause')&&vClick(pauseBtn))
+      return vSpeak('Paused.');
+    return vSpeak('Already paused.');
+  }
+
+  /* ── RESUME ─────────────────────────────────────────────────── */
+  if(/resume|unpause|unfreeze|start refresh/.test(t)){
+    var resumeBtn=document.getElementById('mcoPauseBtn');
+    if(resumeBtn&&resumeBtn.textContent.includes('Resume')&&vClick(resumeBtn))
+      return vSpeak('Resumed.');
+    return vSpeak('Charts already running.');
+  }
+
+  /* ── REFRESH ─────────────────────────────────────────────────── */
+  if(/refresh|update|reload/.test(t)){
+    try{ if(typeof mcoTick==='function'){mcoTick();return vSpeak('Refreshing.');} }catch(e){}
+  }
+
+  /* ══════════════════════════════════════════════════════════════
+     INFORMATION QUERIES
+  ══════════════════════════════════════════════════════════════ */
+
+  if(/buy|long|bullish/.test(t)&&!/sell/.test(t)){
+    var buys=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='B';})
+      .sort(function(a,b){return b.score-a.score;}).slice(0,5);
+    if(!buys.length)return vSpeak('No buy signals. Import your CSV first.');
+    _vLastList=buys;
+    var bm=buys.length+' buys. ';
+    buys.forEach(function(s,i){bm+=(i+1)+'. '+s.symbol+' score '+s.score+'. ';});
+    bm+='Say select '+buys.length+' buy, open charts, or zoom one.';
+    return vSpeak(bm);
+  }
+
+  if(/sell|short|bearish/.test(t)){
+    var sells=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='S';})
+      .sort(function(a,b){return b.score-a.score;}).slice(0,5);
+    if(!sells.length)return vSpeak('No sell signals.');
+    _vLastList=sells;
+    var sm=sells.length+' sells. ';
+    sells.forEach(function(s,i){sm+=(i+1)+'. '+s.symbol+' score '+s.score+'. ';});
+    sm+='Say select '+sells.length+' sell, or open charts, or zoom one.';
+    return vSpeak(sm);
+  }
+
+  if(/market|regime|mood|outlook|nifty|sensex|overall|today/.test(t)){
+    var rMap={full:'Bull market. All green.',bear:'Bear. Stay cautious.',
+              mixed:'Mixed signals.',caution:'Caution. Weak regime.'};
+    var r=window.overallRegime||'unknown';
+    var bc=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='B';}).length;
+    var sc=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='S';}).length;
+    return vSpeak((rMap[r]||r)+' '+bc+' buys, '+sc+' sells.');
+  }
+
+  if(/position|holding|pnl|profit|loss|portfolio|how.*doing/.test(t)){
+    var pos=(window._brokerData&&window._brokerData.positions)||[];
+    if(!pos.length)return vSpeak('No open positions.');
+    var tot=pos.reduce(function(s,p){return s+(p.pnl||0);},0);
+    var pm=pos.length+' positions. '+(tot>=0?'Up ':'Down ')+Math.abs(Math.round(tot)).toLocaleString('en-IN')+' rupees. ';
+    pos.slice(0,3).forEach(function(p){pm+=p.tradingsymbol+' '+(p.pnl>=0?'up':'down')+' '+Math.abs(Math.round(p.pnl))+'. ';});
+    return vSpeak(pm);
+  }
+
+  if(/best|strongest|top pick|number one/.test(t)){
+    var best=(window.allSignals||[]).sort(function(a,b){return b.score-a.score;})[0];
+    if(!best)return vSpeak('No signals loaded.');
+    _vLastList=[best];
+    return vSpeak('Best: '+best.symbol+' score '+best.score
+      +' entry '+(+best.cmp).toFixed(0)+' target '+(+best.tp).toFixed(0)+'. Say zoom to chart it.');
+  }
+
+  /* specific symbol name */
+  var allSyms=Object.keys(window.allStockData||{});
+  for(var si=0;si<allSyms.length;si++){
+    if(new RegExp('\\b'+allSyms[si].toLowerCase()+'\\b').test(t)){
+      var sig2=(window.allSignals||[]).find(function(x){return x.symbol===allSyms[si];});
+      _vLastList=sig2?[sig2]:_vLastList;
+      if(sig2) return vSpeak(allSyms[si]+' '+(sig2.signal.charAt(0)==='B'?'buy':'sell')
+        +' score '+sig2.score+' entry '+(+sig2.cmp).toFixed(0)+'. Say zoom to chart it.');
+      return vSpeak(allSyms[si]+' loaded but no signal today.');
+    }
+  }
+
+  if(/help|what can|commands|how do i/.test(t)){
+    return vSpeak('Say: buy signals, sell signals, select 25 buy, open charts, zoom FDC, zoom 2, next, previous, back, initiate buy, set quantity 50, confirm order, cancel, market, positions, pause, resume.');
+  }
+
+  /* AI fallback */
+  vAskClaude(text);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   CLAUDE API FALLBACK
+══════════════════════════════════════════════════════════════ */
+function vAskClaude(text){
+  var key=vGetAnthKey();
+  if(!key){
+    return vSpeak('I heard: '+text.slice(0,50)+'. Try saying: buy signals, select 25 buy, open charts, or zoom a symbol.');
+  }
+  vLog('🤖 Asking Claude…');
+  if(_vSynth){ try{if(_vSynth.paused)_vSynth.resume();}catch(e){} _vSynth.cancel(); }
+  vSpeak('One moment…');
+  var buys=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='B';})
+    .sort(function(a,b){return b.score-a.score;}).slice(0,5)
+    .map(function(s){return s.symbol+'('+s.score+')';}).join(', ');
+  var sys='You are TRAM, a voice assistant for NSE intraday trading. '
+    +'Regime: '+(window.overallRegime||'unknown')+'. Top buys: '+(buys||'none')+'. '
+    +'Reply in 1-2 spoken sentences only. No markdown. No rupee symbol (say rupees). Max 40 words.';
+  fetch('https://api.anthropic.com/v1/messages',{
+    method:'POST',
+    headers:{'Content-Type':'application/json','x-api-key':key,
+             'anthropic-version':'2023-06-01','anthropic-dangerous-client-side-key':'true'},
+    body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:100,system:sys,
+                         messages:[{role:'user',content:text}]})
+  }).then(function(r){return r.json();})
+  .then(function(d){
+    if(_vSynth)_vSynth.cancel();
+    vSpeak((d.content&&d.content[0]&&d.content[0].text)||'No response.');
+  }).catch(function(){
+    if(_vSynth)_vSynth.cancel();
+    vSpeak('Could not reach AI.');
+  });
+}
+
+/* ══════════════════════════════════════════════════════════════
+   MEDIARECORDER  (Firefox hold-mic)
+══════════════════════════════════════════════════════════════ */
+function vStartMedia(){
+  if(!_hasMedia){ return; }
+  navigator.mediaDevices.getUserMedia({audio:true,video:false})
+  .then(function(stream){
+    _vMediaStream=stream; _vMediaChunks=[];
+    var mime='audio/webm;codecs=opus';
+    if(!MediaRecorder.isTypeSupported(mime)) mime='audio/ogg;codecs=opus';
+    if(!MediaRecorder.isTypeSupported(mime)) mime='';
+    var rec=new MediaRecorder(stream,mime?{mimeType:mime}:{});
+    rec.ondataavailable=function(e){if(e.data&&e.data.size>0)_vMediaChunks.push(e.data);};
+    rec.onstop=function(){
+      stream.getTracks().forEach(function(t){t.stop();}); _vMediaStream=null;
+      vSetMicUI(false);
+      if(!_vMediaChunks.length)return;
+      vTranscribe(new Blob(_vMediaChunks,{type:rec.mimeType||'audio/webm'}));
+    };
+    rec.onerror=function(){ vLog('⚠ Recorder error'); vSetMicUI(false); };
+    rec.start(); _vMediaRec=rec; vSetMicUI(true); vLog('🎙 Recording…');
+  })
+  .catch(function(err){ vLog('⚠ Mic: '+(err.name||'denied')); });
+}
+function vStopMedia(){
+  if(_vMediaRec&&_vMediaRec.state!=='inactive') try{_vMediaRec.stop();}catch(e){}
+  if(_vMediaStream) _vMediaStream.getTracks().forEach(function(t){t.stop();});
+  _vMediaStream=null; vSetMicUI(false);
+}
+function vTranscribe(blob){
+  var key=vGetSTTKey(), url=vSTTEndpoint(key);
+  if(!key||!url){ vLog('ℹ No STT key — add Groq key in ⚙'); return; }
+  var provider=key.startsWith('gsk_')?'Groq':'OpenAI';
+  vLog('⏳ '+provider+'…');
+  if(_vSynth){ try{if(_vSynth.paused)_vSynth.resume();}catch(e){} _vSynth.cancel(); }
+  var ext=blob.type.includes('ogg')?'ogg':'webm';
+  var fd=new FormData();
+  fd.append('file',new File([blob],'audio.'+ext,{type:blob.type}));
+  fd.append('model',key.startsWith('gsk_')?'whisper-large-v3-turbo':'whisper-1');
+  fd.append('language','en');
+  fetch(url,{method:'POST',headers:{'Authorization':'Bearer '+key},body:fd})
+  .then(function(r){return r.json();})
+  .then(function(d){
+    var tx=(d.text||'').trim();
+    if(tx){ vLog('🎙 "'+tx.slice(0,50)+'"'); vExec(tx); }
+    else vLog('⚠ No speech detected');
+  })
+  .catch(function(){ vLog('⚠ STT failed'); });
+}
+
+/* ── Mic button UI ──────────────────────────────────────────── */
+function vSetMicUI(on){
+  var btn=document.getElementById('voiceMicBtn');
+  var ring=document.getElementById('voiceRing');
+  if(!btn)return;
+  btn.style.background=on?'var(--bear)':'var(--amber)';
+  btn.innerHTML=on?'⏹':'🎙';
+  if(ring) ring.style.animationPlayState=on?'running':'paused';
+}
+
+/* ══════════════════════════════════════════════════════════════
+   WISPR BAR — auto-execute after 1.5s pause
+══════════════════════════════════════════════════════════════ */
+function vWisprExecute(){
+  var i=document.getElementById('voiceWisprInp');
+  if(!i)return;
+  var tx=(i.value||'').trim();
+  if(!tx){ vWisprSetStatus('💬',''); return; }
+  vWisprSetStatus('⏳','thinking');
+  i.value='';
+  if(_vSynth){ try{if(_vSynth.paused)_vSynth.resume();}catch(e){} _vSynth.cancel(); }
+  _vBusy=false;
+  setTimeout(function(){ vExec(tx); },60);
+}
+window.vSendTextCommand=function(){ vWisprExecute(); };
+
+/* ══════════════════════════════════════════════════════════════
+   INIT
+══════════════════════════════════════════════════════════════ */
+function vInit(){
+  if(_vSynth&&_vSynth.onvoiceschanged!==undefined)
+    _vSynth.onvoiceschanged=function(){ _vSynth.getVoices(); };
+  if(_vSynth) _vSynth.getVoices();
+
+  /* Firefox whisper row */
+  var wrow=document.getElementById('voiceWhisperRow');
+  if(wrow) wrow.style.display=_hasSR?'none':'block';
+  var lbl=document.getElementById('voiceFFLabel');
+  if(lbl) lbl.style.display='none';
+
+  /* Wispr bar events */
+  var wi=document.getElementById('voiceWisprInp');
+  if(wi){
+    wi.addEventListener('input',function(){
+      vWisprSetStatus('✍','typing');
+      clearTimeout(_vWisprTimer);
+      _vWisprTimer=setTimeout(function(){
+        if((wi.value||'').trim()) vWisprExecute();
+        else vWisprSetStatus('💬','');
+      },1500);
+    });
+    wi.addEventListener('keydown',function(e){
+      if(e.key==='Enter'){ e.preventDefault(); clearTimeout(_vWisprTimer); vWisprExecute(); }
+      if(e.key==='Escape'){ wi.value=''; vWisprSetStatus('💬',''); }
+    });
+    wi.addEventListener('blur',function(){
+      setTimeout(function(){
+        var a=document.activeElement;
+        if(a&&a.tagName!=='INPUT'&&a.tagName!=='TEXTAREA'&&a.tagName!=='BUTTON'&&a.tagName!=='SELECT')
+          wi.focus();
+      },400);
+    });
+    setTimeout(function(){wi.focus();},700);
+  }
+
+  /* Mic button (hold-to-talk) */
+  var btn=document.getElementById('voiceMicBtn');
+  if(btn){
+    btn.style.opacity='1';
+    btn.addEventListener('mousedown',function(e){
+      e.preventDefault();
+      if(_vSynth){ try{if(_vSynth.paused)_vSynth.resume();}catch(e2){} _vSynth.cancel(); }
+      _vBusy=false;
+      if(!_hasSR){ var sk=vGetSTTKey(); if(sk&&_hasMedia) vStartMedia(); }
+      else {
+        if(!_hasSRrecog) _hasSRrecog=vSetupRecog();
+        if(_hasSRrecog) try{_hasSRrecog.start(); vSetMicUI(true);}catch(e2){}
+      }
+    });
+    btn.addEventListener('mouseup', function(){ if(!_hasSR) vStopMedia(); });
+    btn.addEventListener('mouseleave',function(){ if(!_hasSR&&_vMediaRec&&_vMediaRec.state!=='inactive') vStopMedia(); });
+    btn.addEventListener('touchstart',function(e){
+      e.preventDefault();
+      if(_vSynth){ try{if(_vSynth.paused)_vSynth.resume();}catch(e2){} _vSynth.cancel(); }
+      if(!_hasSR){ var sk=vGetSTTKey(); if(sk&&_hasMedia) vStartMedia(); }
+    },{passive:false});
+    btn.addEventListener('touchend',function(){ if(!_hasSR) vStopMedia(); });
+  }
+
+  /* Greeting */
+  setTimeout(function(){
+    vWisprSetStatus('💬','');
+    vSpeak('TRAM ready. Speak via Wispr or hold the mic.');
+    vLog('ℹ Wispr bar active · 1.5s auto-execute · Enter to send immediately');
+  },1200);
+}
+
+/* Chrome/Edge native speech recognition */
+var _hasSRrecog=null;
+function vSetupRecog(){
+  var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SR)return null;
+  var r=new SR(); r.continuous=false; r.interimResults=false; r.lang='en-IN';
+  r.onresult=function(e){ var tx=e.results[0][0].transcript||''; vLog('🎙 "'+tx.slice(0,50)+'"'); vExec(tx); };
+  r.onerror=function(e){ if(e.error!=='no-speech') vLog('⚠ '+e.error); vSetMicUI(false); };
+  r.onend=function(){ vSetMicUI(false); };
+  return r;
+}
+
+if(document.readyState==='loading'){
+  document.addEventListener('DOMContentLoaded',vInit);
+} else { vInit(); }
+
 })();
 </script>
 
