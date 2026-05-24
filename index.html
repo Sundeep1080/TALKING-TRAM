@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0"> 
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="theme-color" content="#d97706">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -5196,6 +5196,24 @@ function mcoZoomClose() {
 #voiceApiKeyInp:focus{border-color:var(--amber)}
 #voiceSaveKey{background:var(--amber);color:#000;border:none;border-radius:4px;padding:4px 0;font-family:var(--mono);font-size:9px;font-weight:700;cursor:pointer;width:100%;letter-spacing:.5px}
 #voiceHint{font-family:var(--mono);font-size:8px;color:var(--text3);margin-top:6px;line-height:1.5}
+/* ── Whisper/Groq key row (Firefox only, shown dynamically) ── */
+#voiceWhisperRow{margin-top:8px;padding-top:8px;border-top:1px solid var(--border);display:none}
+#voiceWhisperRow label{font-family:var(--mono);font-size:9px;color:var(--kite);display:block;margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px}
+#voiceWhisperKeyInp{background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--bright);padding:5px 8px;font-family:var(--mono);font-size:10px;width:100%;outline:none;box-sizing:border-box;margin-bottom:5px}
+#voiceWhisperKeyInp:focus{border-color:var(--kite)}
+#voiceWhisperHint{font-family:var(--mono);font-size:8px;color:var(--text3);line-height:1.55}
+#voiceWhisperHint a{color:var(--kite);text-decoration:none}
+#voiceWhisperHint a:hover{text-decoration:underline}
+/* ── Text-input pop-up (Firefox fallback) ── */
+#voiceTextBox{background:var(--bg2);border:1px solid var(--border2);border-radius:8px;padding:7px 9px;width:262px;display:none;gap:6px;align-items:center;box-shadow:var(--sh-md)}
+#voiceTextInp{flex:1;background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--bright);padding:5px 8px;font-family:var(--mono);font-size:10px;outline:none;min-width:0}
+#voiceTextInp:focus{border-color:var(--amber)}
+#voiceTextSend{background:var(--amber);color:#000;border:none;border-radius:4px;width:28px;height:28px;cursor:pointer;font-size:15px;display:grid;place-items:center;flex-shrink:0;font-weight:700;line-height:1}
+#voiceTextSend:hover{background:#fbbf24}
+/* ── Firefox mode badge ── */
+#voiceFFLabel{font-family:var(--mono);font-size:7px;color:var(--text3);text-align:right;padding-right:3px;display:none;letter-spacing:.4px}
+/* backdrop-filter fallback for older Firefox */
+#voiceLog{background:rgba(13,15,22,.97)!important}
 </style>
 
 <div id="voiceWidget">
@@ -5205,7 +5223,22 @@ function mcoZoomClose() {
     <input id="voiceApiKeyInp" type="password" placeholder="sk-ant-api03-…" autocomplete="off">
     <button id="voiceSaveKey" onclick="vSaveKey()">SAVE KEY</button>
     <div id="voiceHint">Stored in localStorage only.<br>Without key, all rule-based commands still work.</div>
+    <!-- shown only on Firefox -->
+    <div id="voiceWhisperRow">
+      <label>🎙 Groq / OpenAI key · Firefox mic</label>
+      <input id="voiceWhisperKeyInp" type="password" placeholder="gsk_… or sk-…" autocomplete="off">
+      <div id="voiceWhisperHint">
+        Paste a <a href="https://console.groq.com/keys" target="_blank">Groq key</a> (free · 8 hrs/day) or an OpenAI key.<br>
+        Auto-detected from prefix. Without a key, text input is used.
+      </div>
+    </div>
   </div>
+  <!-- text-input bubble (Firefox no-key path) -->
+  <div id="voiceTextBox">
+    <input id="voiceTextInp" type="text" placeholder="Type command… Enter to send">
+    <button id="voiceTextSend" onclick="vSendTextCommand()" title="Send">↵</button>
+  </div>
+  <div id="voiceFFLabel"></div>
   <div id="voiceBtnRow">
     <button id="voiceSettingsBtn" onclick="vToggleSettings()" title="Voice settings">⚙</button>
     <div id="voiceMicWrap">
@@ -5216,44 +5249,115 @@ function mcoZoomClose() {
 </div>
 
 <script>
+/* ═══════════════════════════════════════════════════════════════
+   TRAM VOICE ASSISTANT  —  Firefox + Chrome/Edge compatible
+   ▸ Chrome/Edge  : native Web Speech API (hold-to-talk)
+   ▸ Firefox      : hold → MediaRecorder + Groq/OpenAI Whisper STT
+                    click → text-input fallback (no key needed)
+   ▸ TTS          : window.speechSynthesis on all browsers
+   ═══════════════════════════════════════════════════════════════ */
 (function(){
   'use strict';
-  var _vOn=false,_vRecog=null,_vLog=[],_vSynth=window.speechSynthesis,_vBusy=false;
-  var _V_LSKEY='tram_voice_apikey';
 
-  /* ─── API key helpers ─── */
-  function vGetKey(){return localStorage.getItem(_V_LSKEY)||'';}
+  /* ── State ── */
+  var _vOn=false, _vRecog=null, _vLog=[], _vBusy=false;
+  var _vSynth=window.speechSynthesis;
+  var _vMediaStream=null, _vMediaChunks=[], _vHoldStart=0;
+
+  /* ── LocalStorage keys ── */
+  var _LK_ANTH='tram_voice_apikey';
+  var _LK_STT ='tram_stt_key';          /* Groq gsk_… or OpenAI sk-… */
+
+  /* ── Capability detection ── */
+  var _hasSR   = !!(window.SpeechRecognition||window.webkitSpeechRecognition);
+  var _hasMedia= !!(window.MediaRecorder &&
+                    navigator.mediaDevices &&
+                    navigator.mediaDevices.getUserMedia);
+
+  /* ══════════════════════════════
+     KEY HELPERS
+  ══════════════════════════════ */
+  function vGetAnthKey(){ return localStorage.getItem(_LK_ANTH)||''; }
+  function vGetSTTKey() { return localStorage.getItem(_LK_STT) ||''; }
+
+  /* Auto-detect provider from key prefix */
+  function vSTTEndpoint(key){
+    if(!key)return null;
+    /* Groq keys start with gsk_ */
+    if(key.startsWith('gsk_'))
+      return 'https://api.groq.com/openai/v1/audio/transcriptions';
+    /* OpenAI keys start with sk- */
+    return 'https://api.openai.com/v1/audio/transcriptions';
+  }
+
   window.vSaveKey=function(){
-    var v=(document.getElementById('voiceApiKeyInp').value||'').trim();
-    if(v){localStorage.setItem(_V_LSKEY,v);vLog('✓ API key saved');}
-    else{localStorage.removeItem(_V_LSKEY);vLog('ℹ Key cleared — rule-based only');}
+    /* Anthropic key */
+    var a=(document.getElementById('voiceApiKeyInp').value||'').trim();
+    if(a&&!a.endsWith('…')){ localStorage.setItem(_LK_ANTH,a); vLog('✓ Anthropic key saved'); }
+    else if(!a){ localStorage.removeItem(_LK_ANTH); }
+
+    /* STT key (Groq or OpenAI) */
+    var wi=document.getElementById('voiceWhisperKeyInp');
+    if(wi){
+      var s=(wi.value||'').trim();
+      if(s&&!s.endsWith('…')){
+        localStorage.setItem(_LK_STT,s);
+        var lbl=s.startsWith('gsk_')?'Groq':'OpenAI';
+        vLog('✓ '+lbl+' STT key saved');
+      } else if(!s){ localStorage.removeItem(_LK_STT); }
+    }
     document.getElementById('voiceSettingsPanel').style.display='none';
   };
+
   window.vToggleSettings=function(){
     var p=document.getElementById('voiceSettingsPanel');
     var open=p.style.display!=='none';
     p.style.display=open?'none':'block';
-    if(!open){var k=vGetKey();document.getElementById('voiceApiKeyInp').value=k?k.slice(0,14)+'…':'';}
+    if(!open){
+      var ak=vGetAnthKey();
+      document.getElementById('voiceApiKeyInp').value=ak?ak.slice(0,14)+'…':'';
+      var wi=document.getElementById('voiceWhisperKeyInp');
+      if(wi){ var sk=vGetSTTKey(); wi.value=sk?sk.slice(0,14)+'…':''; }
+    }
   };
 
-  /* ─── Speak ─── */
+  /* ══════════════════════════════
+     TTS  —  Firefox-safe
+  ══════════════════════════════ */
   function vSpeak(text){
     if(!text||!_vSynth)return;
     _vBusy=true;
+    /* Firefox: synth can get stuck in paused state after inactivity */
+    try{ if(_vSynth.paused) _vSynth.resume(); }catch(e){}
     _vSynth.cancel();
-    var u=new SpeechSynthesisUtterance(text);
-    u.rate=1.05;u.pitch=1.0;u.volume=1.0;
+
     var vv=_vSynth.getVoices();
     var pick=vv.find(function(v){return v.lang==='en-IN';})
              ||vv.find(function(v){return v.lang==='en-GB';})
              ||vv.find(function(v){return v.lang.startsWith('en');});
-    if(pick)u.voice=pick;
-    u.onend=function(){_vBusy=false;};
-    _vSynth.speak(u);
+
+    /* Firefox cuts off utterances > ~15 s — split at sentence boundaries */
+    var chunks=(!_hasSR && text.length>160)
+      ? (text.match(/[^.!?]+[.!?]+\s*/g)||[text])
+      : [text];
+
+    var idx=0;
+    function next(){
+      if(idx>=chunks.length){_vBusy=false;return;}
+      var u=new SpeechSynthesisUtterance(chunks[idx++].trim());
+      u.rate=1.05; u.pitch=1.0; u.volume=1.0;
+      if(pick) u.voice=pick;
+      u.onend=next;
+      u.onerror=function(){_vBusy=false;};
+      _vSynth.speak(u);
+    }
+    next();
     vLog('🔊 '+text.slice(0,72)+(text.length>72?'…':''));
   }
 
-  /* ─── Log strip ─── */
+  /* ══════════════════════════════
+     LOG STRIP
+  ══════════════════════════════ */
   function vLog(msg){
     _vLog.unshift(msg);
     if(_vLog.length>5)_vLog.pop();
@@ -5263,11 +5367,133 @@ function mcoZoomClose() {
     el.innerHTML=_vLog.map(function(l){return'<div>'+l+'</div>';}).join('');
   }
 
-  /* ─── Rule-based command parser ─── */
+  /* ══════════════════════════════
+     TEXT-INPUT FALLBACK
+  ══════════════════════════════ */
+  function vShowText(){
+    var b=document.getElementById('voiceTextBox');
+    if(b)b.style.display='flex';
+    var i=document.getElementById('voiceTextInp');
+    if(i){ i.value=''; setTimeout(function(){i.focus();},80); }
+  }
+  function vHideText(){
+    var b=document.getElementById('voiceTextBox');
+    if(b)b.style.display='none';
+  }
+  window.vSendTextCommand=function(){
+    var i=document.getElementById('voiceTextInp');
+    if(!i)return;
+    var tx=(i.value||'').trim();
+    if(!tx)return;
+    vHideText();
+    vLog('⌨ "'+tx.slice(0,55)+(tx.length>55?'…':'')+'"');
+    vParse(tx);
+  };
+
+  /* ══════════════════════════════
+     MEDIARECORDER  (Firefox mic)
+  ══════════════════════════════ */
+  function vStartMedia(){
+    if(!_hasMedia){ vShowText(); return; }
+    navigator.mediaDevices.getUserMedia({audio:true,video:false})
+    .then(function(stream){
+      _vMediaStream=stream;
+      _vMediaChunks=[];
+      /* Prefer WebM/Opus; Firefox also supports OGG/Opus */
+      var mime='audio/webm;codecs=opus';
+      if(!MediaRecorder.isTypeSupported(mime)) mime='audio/ogg;codecs=opus';
+      if(!MediaRecorder.isTypeSupported(mime)) mime='';
+      var rec=new MediaRecorder(stream, mime?{mimeType:mime}:{});
+      rec.ondataavailable=function(e){
+        if(e.data&&e.data.size>0) _vMediaChunks.push(e.data);
+      };
+      rec.onstop=function(){
+        stream.getTracks().forEach(function(t){t.stop();});
+        _vMediaStream=null;
+        vSetUI(false);
+        if(!_vMediaChunks.length) return;
+        var blob=new Blob(_vMediaChunks,{type:rec.mimeType||'audio/webm'});
+        vTranscribe(blob);
+      };
+      rec.onerror=function(){
+        vLog('⚠ Recorder error'); vSetUI(false); vShowText();
+      };
+      rec.start();
+      _vRecog=rec;
+      vSetUI(true);
+      vLog('🎙 Recording… release to send');
+    })
+    .catch(function(err){
+      vLog('⚠ Mic blocked: '+(err.name||'denied'));
+      vSpeak('Microphone access was denied. Click the mic to type instead.');
+      vShowText();
+    });
+  }
+
+  function vStopMedia(){
+    if(_vRecog && typeof _vRecog.stop==='function'){
+      try{ if(_vRecog.state!=='inactive') _vRecog.stop(); }catch(e){}
+    }
+    if(_vMediaStream){
+      _vMediaStream.getTracks().forEach(function(t){t.stop();});
+      _vMediaStream=null;
+    }
+    vSetUI(false);
+  }
+
+  /* ══════════════════════════════
+     TRANSCRIPTION  (Groq ▸ OpenAI ▸ text)
+  ══════════════════════════════ */
+  function vTranscribe(blob){
+    var key=vGetSTTKey();
+    var url=vSTTEndpoint(key);
+
+    if(!key||!url){
+      vLog('ℹ No STT key — add a free Groq key in ⚙');
+      vSpeak('Add a Groq or OpenAI key in voice settings to use the microphone.');
+      vShowText();
+      return;
+    }
+
+    var provider=key.startsWith('gsk_')?'Groq':'OpenAI';
+    vLog('⏳ Transcribing via '+provider+'…');
+    if(_vSynth)_vSynth.cancel();
+    vSpeak('One moment…');
+
+    var ext=blob.type.includes('ogg')?'ogg':'webm';
+    var fd=new FormData();
+    fd.append('file', new File([blob],'audio.'+ext,{type:blob.type}));
+    fd.append('model', key.startsWith('gsk_')?'whisper-large-v3-turbo':'whisper-1');
+    fd.append('language','en');
+
+    fetch(url,{
+      method:'POST',
+      headers:{'Authorization':'Bearer '+key},
+      body:fd
+    })
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      var tx=(d.text||'').trim();
+      if(tx){
+        vLog('🎙 "'+tx.slice(0,55)+(tx.length>55?'…':'')+'"');
+        vParse(tx);
+      } else {
+        vLog('⚠ No speech detected');
+        vShowText();
+      }
+    })
+    .catch(function(){
+      vLog('⚠ STT request failed');
+      vShowText();
+    });
+  }
+
+  /* ══════════════════════════════
+     COMMAND PARSER  (unchanged)
+  ══════════════════════════════ */
   function vParse(text){
     var t=text.toLowerCase().trim();
 
-    /* top buy signals */
     if(/top.*(buy|long)|buy.*(signal|stock)/i.test(t)){
       var b=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='B';})
            .sort(function(a,c){return c.score-a.score;}).slice(0,5);
@@ -5282,7 +5508,6 @@ function mcoZoomClose() {
       return vSpeak(m);
     }
 
-    /* top sell signals */
     if(/top.*(sell|short)|sell.*(signal|stock)/i.test(t)){
       var s2=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='S';})
             .sort(function(a,c){return c.score-a.score;}).slice(0,5);
@@ -5292,7 +5517,6 @@ function mcoZoomClose() {
       return vSpeak(m2);
     }
 
-    /* market regime */
     if(/regime|market.*(mood|condition|status)|overall/i.test(t)){
       var rMap={
         full:'Full bull market. All indices are green. Good environment for buying.',
@@ -5304,7 +5528,6 @@ function mcoZoomClose() {
       return vSpeak('Market regime is: '+(rMap[r]||r));
     }
 
-    /* signal count */
     if(/how many|count.*(signal|stock)|total.*(signal|stock)/i.test(t)){
       var bc=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='B';}).length;
       var sc=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='S';}).length;
@@ -5312,7 +5535,6 @@ function mcoZoomClose() {
       return vSpeak(bc+' buy signals and '+sc+' sell signals across '+tot+' symbols loaded.');
     }
 
-    /* P&L / positions */
     if(/p.?n.?l|profit|loss|position|holding|portfolio|how.*doing/i.test(t)){
       var pos=(window._brokerData&&window._brokerData.positions)||[];
       if(!pos.length)return vSpeak('No open positions. Connect Kite and refresh broker data.');
@@ -5325,31 +5547,26 @@ function mcoZoomClose() {
       return vSpeak(msg3);
     }
 
-    /* pause */
     if(/\bpause\b/i.test(t)){
       if(typeof window.mcoPauseToggle==='function'&&!window._mcoPaused){window.mcoPauseToggle();return vSpeak('Charts paused.');}
       return vSpeak('Charts are already paused.');
     }
 
-    /* resume */
     if(/\bresume\b/i.test(t)){
       if(typeof window.mcoPauseToggle==='function'&&window._mcoPaused){window.mcoPauseToggle();return vSpeak('Charts resumed.');}
       return vSpeak('Charts are already running.');
     }
 
-    /* refresh */
     if(/refresh|update.*(chart|data)/i.test(t)){
       if(typeof window.mcoTick==='function'){window.mcoTick();return vSpeak('Refreshing charts now.');}
     }
 
-    /* close chart */
     if(/close|back to grid|go back/i.test(t)){
       if(typeof window.mcoZoomClose==='function')window.mcoZoomClose();
       if(typeof window.mcoClose==='function')window.mcoClose();
       return vSpeak('Closed.');
     }
 
-    /* open chart SYMBOL */
     var cm=t.match(/(?:open|show|chart|zoom|load)(?:\s+chart)?(?:\s+for)?\s+([a-z0-9&]+)\s*$/i);
     if(cm){
       var sym=cm[1].toUpperCase().trim();
@@ -5362,23 +5579,23 @@ function mcoZoomClose() {
       return vSpeak('Symbol '+sym+' not found in loaded data.');
     }
 
-    /* help */
     if(/help|what can you|commands/i.test(t)){
       return vSpeak('You can say: top buy signals, top sell signals, market regime, signal count, P and L, open chart for a symbol, refresh, pause, or resume. Add an Anthropic key in voice settings for free-form questions.');
     }
 
-    /* fallback to Claude API */
     vAskClaude(text);
   }
 
-  /* ─── Claude API fallback ─── */
+  /* ══════════════════════════════
+     CLAUDE API FALLBACK
+  ══════════════════════════════ */
   function vAskClaude(text){
-    var key=vGetKey();
+    var key=vGetAnthKey();
     if(!key){
       return vSpeak('Command not recognised. Say help for the full list, or add an Anthropic API key in voice settings for smart free-form answers.');
     }
     vLog('🤖 Asking Claude…');
-    _vSynth.cancel();
+    if(_vSynth)_vSynth.cancel();
     vSpeak('One moment…');
     var buys=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='B';})
              .sort(function(a,b){return b.score-a.score;}).slice(0,8)
@@ -5407,80 +5624,161 @@ function mcoZoomClose() {
     })
     .then(function(r){return r.json();})
     .then(function(d){
-      _vSynth.cancel();
+      if(_vSynth)_vSynth.cancel();
       var reply=d.content&&d.content[0]&&d.content[0].text;
       vSpeak(reply||'Sorry, no response received.');
     })
     .catch(function(){
-      _vSynth.cancel();
+      if(_vSynth)_vSynth.cancel();
       vSpeak('Could not reach AI. Check your connection or API key in voice settings.');
     });
   }
 
-  /* ─── Speech recognition ─── */
+  /* ══════════════════════════════
+     CHROME/EDGE: WEB SPEECH API
+  ══════════════════════════════ */
   function vSetupRecog(){
     var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
     if(!SR)return null;
     var r=new SR();
-    r.continuous=false;r.interimResults=false;r.lang='en-IN';
+    r.continuous=false; r.interimResults=false; r.lang='en-IN';
     r.onresult=function(e){
       var tx=e.results[0][0].transcript||'';
       vLog('🎙 "'+tx.slice(0,55)+(tx.length>55?'…':'')+'"');
       vParse(tx);
     };
-    r.onerror=function(e){
-      if(e.error!=='no-speech')vLog('⚠ Mic: '+e.error);
-      vSetUI(false);
-    };
-    r.onend=function(){vSetUI(false);};
+    r.onerror=function(e){ if(e.error!=='no-speech') vLog('⚠ Mic: '+e.error); vSetUI(false); };
+    r.onend=function(){ vSetUI(false); };
     return r;
   }
 
-  /* ─── UI helpers ─── */
+  /* ══════════════════════════════
+     UI HELPERS
+  ══════════════════════════════ */
   function vSetUI(on){
     _vOn=on;
     var btn=document.getElementById('voiceMicBtn');
     var ring=document.getElementById('voiceRing');
     if(!btn)return;
     if(on){
-      btn.style.background='var(--bear)';
-      btn.innerHTML='⏹';
-      if(ring)ring.style.animationPlayState='running';
+      btn.style.background='var(--bear)'; btn.innerHTML='⏹';
+      if(ring) ring.style.animationPlayState='running';
     } else {
-      btn.style.background='var(--amber)';
-      btn.innerHTML='🎙';
-      if(ring)ring.style.animationPlayState='paused';
+      btn.style.background='var(--amber)'; btn.innerHTML='🎙';
+      if(ring) ring.style.animationPlayState='paused';
     }
   }
 
-  /* ─── Start / stop ─── */
+  /* ══════════════════════════════
+     START / STOP
+     Firefox UX:
+       quick click  (<500ms) → text input
+       hold (≥500ms) → MediaRecorder → Whisper/Groq
+  ══════════════════════════════ */
   function vStart(){
-    if(_vBusy&&_vSynth){_vSynth.cancel();_vBusy=false;}
-    if(!_vRecog)_vRecog=vSetupRecog();
-    if(!_vRecog)return vSpeak('Speech recognition is not supported. Please use Chrome or Edge.');
-    try{_vRecog.start();vSetUI(true);vLog('🎙 Listening…');}catch(e){}
+    if(_vBusy&&_vSynth){ _vSynth.cancel(); _vBusy=false; }
+    _vHoldStart=Date.now();
+
+    if(!_hasSR){
+      /* Firefox: start recording immediately so audio isn't clipped */
+      var sttKey=vGetSTTKey();
+      if(sttKey&&_hasMedia){
+        vStartMedia();
+      }
+      /* If no STT key, wait for mouseup to decide click vs hold */
+      return;
+    }
+
+    /* Chrome/Edge */
+    if(!_vRecog) _vRecog=vSetupRecog();
+    if(!_vRecog){ vLog('⚠ Mic not available'); return; }
+    try{ _vRecog.start(); vSetUI(true); vLog('🎙 Listening…'); }catch(e){}
   }
+
   function vStop(){
-    if(_vRecog&&_vOn){try{_vRecog.stop();}catch(e){}}
+    var held=Date.now()-_vHoldStart;
+
+    if(!_hasSR){
+      var sttKey=vGetSTTKey();
+      if(sttKey&&_hasMedia){
+        /* Was recording — stop and transcribe */
+        vStopMedia();
+      } else {
+        /* No STT key: quick tap → text input */
+        vShowText();
+      }
+      return;
+    }
+
+    /* Chrome/Edge */
+    if(_vRecog&&_vOn){ try{ _vRecog.stop(); }catch(e){} }
     vSetUI(false);
   }
 
-  /* ─── Init ─── */
+  /* ══════════════════════════════
+     INIT
+  ══════════════════════════════ */
   function vInit(){
     if(_vSynth&&_vSynth.onvoiceschanged!==undefined)
-      _vSynth.onvoiceschanged=function(){_vSynth.getVoices();};
-    if(_vSynth)_vSynth.getVoices();
+      _vSynth.onvoiceschanged=function(){ _vSynth.getVoices(); };
+    if(_vSynth) _vSynth.getVoices();
+
     var btn=document.getElementById('voiceMicBtn');
-    if(!btn)return;
-    /* desktop hold-to-talk */
-    btn.addEventListener('mousedown',function(e){e.preventDefault();vStart();});
-    btn.addEventListener('mouseup',function(){setTimeout(vStop,450);});
-    btn.addEventListener('mouseleave',function(){if(_vOn)vStop();});
-    /* mobile hold-to-talk */
-    btn.addEventListener('touchstart',function(e){e.preventDefault();vStart();});
-    btn.addEventListener('touchend',function(){setTimeout(vStop,450);});
-    /* greeting */
-    setTimeout(function(){vSpeak('TRAM voice ready. Hold the mic to talk.');},2000);
+    if(!btn) return;
+
+    var wrow=document.getElementById('voiceWhisperRow');
+    var lbl =document.getElementById('voiceFFLabel');
+
+    if(!_hasSR){
+      /* Firefox: always fully visible and active */
+      btn.style.opacity='1';
+      if(wrow) wrow.style.display='block';
+      if(lbl){
+        var sttKey=vGetSTTKey();
+        var mode=sttKey ? (sttKey.startsWith('gsk_')?'Groq':'OpenAI')+' mic' : 'text input';
+        lbl.textContent='Firefox · '+mode;
+        lbl.style.display='block';
+      }
+      btn.title='Hold to record (Groq/OpenAI key)\nClick for text input';
+    } else {
+      if(wrow) wrow.style.display='none';
+      if(lbl)  lbl.style.display='none';
+    }
+
+    /* ── Mouse events ── */
+    btn.addEventListener('mousedown',function(e){ e.preventDefault(); vStart(); });
+    btn.addEventListener('mouseup',  function(){ setTimeout(vStop,_hasSR?450:0); });
+    btn.addEventListener('mouseleave',function(){ if(_vOn) vStop(); });
+
+    /* ── Touch events ── */
+    btn.addEventListener('touchstart',function(e){ e.preventDefault(); vStart(); },{passive:false});
+    btn.addEventListener('touchend',  function(){ setTimeout(vStop,_hasSR?450:0); });
+
+    /* ── Text-input keyboard ── */
+    var ti=document.getElementById('voiceTextInp');
+    if(ti){
+      ti.addEventListener('keydown',function(e){
+        if(e.key==='Enter'){ e.preventDefault(); window.vSendTextCommand(); }
+        if(e.key==='Escape'){ vHideText(); }
+      });
+    }
+
+    /* ── Greeting ── */
+    setTimeout(function(){
+      if(_hasSR){
+        vSpeak('TRAM voice ready. Hold the mic to talk.');
+      } else {
+        var sk=vGetSTTKey();
+        var provider=sk?(sk.startsWith('gsk_')?'Groq':'OpenAI'):null;
+        if(provider){
+          vLog('ℹ Firefox · '+provider+' mic active · hold button to record');
+          vSpeak('TRAM ready on Firefox. Hold the mic to record.');
+        } else {
+          vLog('ℹ Firefox · click mic to type · add Groq key in ⚙ for voice');
+          vSpeak('TRAM ready. Click the mic to type, or add a free Groq key for voice input.');
+        }
+      }
+    },1500);
   }
 
   if(document.readyState==='loading'){
