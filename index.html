@@ -5262,6 +5262,42 @@ function mcoZoomClose() {
 </div>
 
 <script>
+/* ── TRAM VOICE BRIDGE ─────────────────────────────────────────────────
+   Exposes internal let/var app state onto window so the voice script
+   can read live data without touching the main app code.
+   Also provides vOpenChart() which injects a signal into _mcoSel
+   so mcoZoomOpen() can open it even if it's not in the chart grid.
+──────────────────────────────────────────────────────────────────────── */
+(function(){
+  var POLL=800;
+  function bridge(){
+    /* signals */
+    try{ if(typeof allSignals!=='undefined')  window.allSignals  = allSignals;  }catch(e){}
+    try{ if(typeof allStockData!=='undefined') window.allStockData= allStockData;}catch(e){}
+    try{ if(typeof overallRegime!=='undefined')window.overallRegime=overallRegime;}catch(e){}
+    try{ if(typeof _brokerData!=='undefined')  window._brokerData = _brokerData; }catch(e){}
+    try{ if(typeof _mcoSel!=='undefined')      window._mcoSel     = _mcoSel;     }catch(e){}
+  }
+  bridge();
+  setInterval(bridge, POLL);
+
+  /* Open a chart for any signal — injects into _mcoSel if needed */
+  window.vOpenChart=function(sigObj){
+    if(!sigObj)return false;
+    var sym=sigObj.symbol;
+    try{
+      if(typeof _mcoSel!=='undefined'&&typeof mcoZoomOpen==='function'){
+        if(!_mcoSel[sym]) _mcoSel[sym]=sigObj;   /* inject so zoom works */
+        mcoZoomOpen(sym,'');
+        return true;
+      }
+    }catch(e){}
+    return false;
+  };
+})();
+</script>
+
+<script>
 /* ═══════════════════════════════════════════════════════════════
    TRAM VOICE ASSISTANT  —  Firefox + Chrome/Edge compatible
    ▸ Chrome/Edge  : native Web Speech API (hold-to-talk)
@@ -5539,136 +5575,273 @@ function mcoZoomClose() {
   ══════════════════════════════ */
   function vParse(text){
     var t=text.toLowerCase().trim();
-    /* strip filler words */
-    t=t.replace(/^(okay|ok|hey|tram|hi|hello|uh|um|so|well|please|can you|could you|tell me|show me|give me|what are|what is|whats|i want to know|i want)\s+/,'').trim();
+    /* strip natural-language filler */
+    t=t.replace(/^(okay|ok|hey|tram|hi|hello|uh|um|so|well|please|can you|could you|tell me|show me|give me|i want to|now|go ahead and|let's|lets)\s+/,'').trim();
 
-    /* ── OPEN (uses last shown list as context) ───────────────── */
-    if(/^open$|^open (it|that|first|top|number one|1st|the first|the top)/.test(t)||
-       /^(open|chart|show chart)\s+(number|no\.?)?\s*([1-5])/.test(t)){
-      var numMatch=t.match(/([1-5])/);
-      var idx2=numMatch?parseInt(numMatch[1])-1:0;
-      if(_vLastList.length){
-        var pick=_vLastList[Math.min(idx2,_vLastList.length-1)];
-        if(typeof window.mcoZoomOpen==='function'){ window.mcoZoomOpen(pick.symbol,''); }
-        return vSpeak(pick.symbol+'.');
+    vLog('🗣 '+text.slice(0,50)+(text.length>50?'…':''));
+
+    /* ═══════════════════════════════════════════════
+       CHART GRID ACTIONS
+    ═══════════════════════════════════════════════ */
+
+    /* SELECT top N buy signals */
+    var selMatch=t.match(/select\s+(?:top\s+|first\s+)?(\d+|all)\s*(buy|sell|signal)?/);
+    if(selMatch||/select all/.test(t)){
+      var n=selMatch&&selMatch[1]!=='all'?parseInt(selMatch[1]):25;
+      var side=(selMatch&&selMatch[2]&&selMatch[2].startsWith('s'))?'sell':'buy';
+      var list=(window.allSignals||[])
+        .filter(function(s){return side==='buy'?s.signal.charAt(0)==='B':s.signal.charAt(0)==='S';})
+        .sort(function(a,b){return b.score-a.score;}).slice(0,n);
+      if(!list.length)return vSpeak('No signals loaded yet. Import your CSV first.');
+      /* clear existing selection */
+      try{
+        document.querySelectorAll('.mco-cb').forEach(function(cb){
+          cb.checked=false;
+          var sym=cb.id.replace('mcb_','');
+          if(typeof _mcoSel!=='undefined') delete _mcoSel[sym];
+        });
+        var ba=document.getElementById('cbBuyAll');if(ba)ba.checked=false;
+        var sa=document.getElementById('cbSellAll');if(sa)sa.checked=false;
+      }catch(e){}
+      /* select the list */
+      var added=0;
+      list.forEach(function(sig){
+        try{
+          var cb=document.getElementById('mcb_'+sig.symbol);
+          if(cb&&typeof mcoToggle==='function'){
+            cb.checked=true;
+            mcoToggle(cb,sig.symbol,sig.signal,sig.tp,sig.sl,sig.score,sig.cmp);
+            added++;
+          } else if(typeof _mcoSel!=='undefined'){
+            _mcoSel[sig.symbol]={symbol:sig.symbol,signal:sig.signal,tp:sig.tp,sl:sig.sl,score:sig.score,cmp:sig.cmp};
+            added++;
+          }
+        }catch(e){}
+      });
+      _vLastList=list;
+      return vSpeak(added+' '+side+' signals selected. Say open charts to load them.');
+    }
+
+    /* OPEN CHARTS (render the grid) */
+    if(/open (all |the )?charts?|load (all |the )?charts?|show (all |the )?charts?|launch charts?|render charts?/.test(t)){
+      try{
+        if(typeof mcoOpen==='function'){ mcoOpen(); return vSpeak('Opening charts now.'); }
+      }catch(e){}
+      return vSpeak('Chart function not available.');
+    }
+
+    /* OPEN / ZOOM specific symbol or number from last list */
+    var openMatch=t.match(/(?:open|zoom|chart|show chart for?|zoom into?)\s+(?:number\s+|no\.?\s*)?([1-5]|[a-z0-9&]{2,12})/);
+    if(openMatch||(/ ^open$|^zoom$/.test(t)&&_vLastList.length)){
+      var target=openMatch?openMatch[1].trim():null;
+      var sigToOpen=null;
+      if(!target||target==='1'||/^first|^top/.test(target)){
+        sigToOpen=_vLastList[0];
+      } else if(/^\d$/.test(target)){
+        sigToOpen=_vLastList[parseInt(target)-1]||_vLastList[0];
+      } else {
+        /* symbol name */
+        var symUp=target.toUpperCase();
+        sigToOpen=(window.allSignals||[]).find(function(s){return s.symbol===symUp;})
+                  ||_vLastList.find(function(s){return s.symbol===symUp;});
       }
-      return vSpeak('Say buy signals first, then say open.');
+      if(sigToOpen){
+        if(window.vOpenChart&&window.vOpenChart(sigToOpen)){
+          return vSpeak('Zooming '+sigToOpen.symbol+'.');
+        }
+      }
+      if(!target&&_vLastList.length){
+        sigToOpen=_vLastList[0];
+        if(window.vOpenChart&&window.vOpenChart(sigToOpen)) return vSpeak('Zooming '+sigToOpen.symbol+'.');
+      }
+      return vSpeak('Say select buy signals first, then open charts, then zoom a symbol.');
     }
 
-    /* ── BUY signals ──────────────────────────────────────────── */
-    if(/buy|long|bullish|b2|b3/.test(t)){
-      var b=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='B';})
-           .sort(function(a,c){return c.score-a.score;}).slice(0,5);
-      if(!b.length)return vSpeak('No buy signals yet. Import your CSV first.');
-      _vLastList=b;
-      var m=b.length+' buys. ';
-      b.forEach(function(s,i){ m+=(i+1)+'. '+s.symbol+' '+s.score+'. '; });
-      m+='Say open, or open 2, open 3 to chart any of them.';
-      return vSpeak(m);
+    /* BACK / CLOSE zoom */
+    if(/back|close chart|close zoom|go back|exit chart|back to grid/.test(t)){
+      try{if(typeof mcoZoomClose==='function')mcoZoomClose();}catch(e){}
+      return vSpeak('Back to grid.');
     }
 
-    /* ── SELL signals ─────────────────────────────────────────── */
-    if(/sell|short|bearish|s2|s3/.test(t)){
-      var s2=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='S';})
-            .sort(function(a,c){return c.score-a.score;}).slice(0,5);
-      if(!s2.length)return vSpeak('No sell signals.');
-      _vLastList=s2;
-      var m2=s2.length+' sells. ';
-      s2.forEach(function(s,i){ m2+=(i+1)+'. '+s.symbol+' '+s.score+'. '; });
-      m2+='Say open, or open 2 to chart any.';
-      return vSpeak(m2);
+    /* NEXT chart */
+    if(/next|next chart|next stock/.test(t)){
+      var cur=typeof _zoomSym!=='undefined'?_zoomSym:null;
+      var idx3=cur?_vLastList.findIndex(function(s){return s.symbol===cur;}): -1;
+      var nxt=_vLastList[idx3+1];
+      if(nxt){
+        if(window.vOpenChart&&window.vOpenChart(nxt)) return vSpeak(nxt.symbol+'.');
+      }
+      return vSpeak('No more charts in the list.');
     }
 
-    /* ── MARKET / REGIME ──────────────────────────────────────── */
-    if(/market|regime|mood|condition|status|trend|outlook|overall|indices|nifty|sensex|today/.test(t)){
-      var rMap={
-        full:'Bull market. All green. Good to buy.',
-        bear:'Bear regime. All red. Stay cautious.',
-        mixed:'Mixed. Indices disagree. Be selective.',
-        caution:'Caution. Weak regime. Raise score filter.'
-      };
+    /* PREVIOUS chart */
+    if(/previous|prev chart|go back one|last chart/.test(t)){
+      var cur2=typeof _zoomSym!=='undefined'?_zoomSym:null;
+      var idx4=cur2?_vLastList.findIndex(function(s){return s.symbol===cur2;}): 1;
+      var prv=_vLastList[idx4-1];
+      if(prv){
+        if(window.vOpenChart&&window.vOpenChart(prv)) return vSpeak(prv.symbol+'.');
+      }
+      return vSpeak('Already at the first chart.');
+    }
+
+    /* ═══════════════════════════════════════════════
+       ORDER ACTIONS
+    ═══════════════════════════════════════════════ */
+
+    /* INITIATE BUY / PLACE BUY */
+    if(/(?:initiate|place|execute|put|fire|trigger|do)\s+(?:a\s+)?buy|buy order|buy this|buy it|go long/.test(t)){
+      try{
+        var zSym=typeof _zoomSym!=='undefined'?_zoomSym:null;
+        var zObj=typeof _zoomSigObj!=='undefined'?_zoomSigObj:null;
+        if(!zSym&&_vLastList.length){zSym=_vLastList[0].symbol;zObj=_vLastList[0];}
+        if(zSym&&zObj&&typeof showOrderModal==='function'){
+          showOrderModal(zSym,'BUY',zObj.cmp||0,zObj.tp||0,zObj.sl||0);
+          return vSpeak('Buy order window open for '+zSym+'. Check quantity and price, then confirm.');
+        }
+      }catch(e){}
+      return vSpeak('Please zoom into a chart first, then say initiate buy.');
+    }
+
+    /* INITIATE SELL / PLACE SELL */
+    if(/(?:initiate|place|execute|put|fire|trigger|do)\s+(?:a\s+)?sell|sell order|sell this|sell it|go short/.test(t)){
+      try{
+        var zSym2=typeof _zoomSym!=='undefined'?_zoomSym:null;
+        var zObj2=typeof _zoomSigObj!=='undefined'?_zoomSigObj:null;
+        if(!zSym2&&_vLastList.length){zSym2=_vLastList[0].symbol;zObj2=_vLastList[0];}
+        if(zSym2&&zObj2&&typeof showOrderModal==='function'){
+          showOrderModal(zSym2,'SELL',zObj2.cmp||0,zObj2.tp||0,zObj2.sl||0);
+          return vSpeak('Sell order window open for '+zSym2+'. Check quantity and price, then confirm.');
+        }
+      }catch(e){}
+      return vSpeak('Please zoom into a chart first, then say initiate sell.');
+    }
+
+    /* CONFIRM / PLACE ORDER (click the confirm button) */
+    if(/confirm order|place order|confirm|execute order|submit order|yes.*order|proceed/.test(t)){
+      try{
+        var confirmBtn=document.getElementById('omConfirmBtn');
+        if(confirmBtn&&!confirmBtn.disabled){
+          confirmBtn.click();
+          return vSpeak('Order placed.');
+        }
+      }catch(e){}
+      return vSpeak('No order window is open to confirm.');
+    }
+
+    /* CANCEL / CLOSE order modal */
+    if(/cancel order|close order|dismiss|cancel/.test(t)){
+      try{
+        if(typeof closeOrderModal==='function'){closeOrderModal();return vSpeak('Order cancelled.');}
+      }catch(e){}
+    }
+
+    /* SET QUANTITY */
+    var qtyMatch=t.match(/(?:set|change|make it|quantity|qty)\s+(?:to\s+)?(\d+)/);
+    if(qtyMatch){
+      var qtyInp=document.getElementById('omQty');
+      if(qtyInp){
+        qtyInp.value=qtyMatch[1];
+        if(typeof updateOmTotal==='function')updateOmTotal();
+        return vSpeak('Quantity set to '+qtyMatch[1]+'.');
+      }
+      return vSpeak('Order window is not open.');
+    }
+
+    /* ═══════════════════════════════════════════════
+       PAUSE / RESUME / REFRESH
+    ═══════════════════════════════════════════════ */
+    if(/pause|freeze|stop refresh/.test(t)){
+      try{if(typeof mcoPauseToggle==='function'&&!_mcoPaused){mcoPauseToggle();return vSpeak('Charts paused.');}}catch(e){}
+      return vSpeak('Already paused.');
+    }
+    if(/resume|unpause|start refresh|unfreeze/.test(t)){
+      try{if(typeof mcoPauseToggle==='function'&&_mcoPaused){mcoPauseToggle();return vSpeak('Charts resumed.');}}catch(e){}
+      return vSpeak('Charts are already running.');
+    }
+    if(/refresh|update|reload/.test(t)){
+      try{if(typeof mcoTick==='function'){mcoTick();return vSpeak('Refreshing.');}}catch(e){}
+    }
+
+    /* ═══════════════════════════════════════════════
+       MARKET & SIGNAL INFO
+    ═══════════════════════════════════════════════ */
+
+    /* BUY signals list */
+    if(/buy|long|bullish/.test(t)&&!/sell/.test(t)){
+      var buys=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='B';})
+        .sort(function(a,b){return b.score-a.score;}).slice(0,5);
+      if(!buys.length)return vSpeak('No buy signals. Import your CSV first.');
+      _vLastList=buys;
+      var bm=buys.length+' buys. ';
+      buys.forEach(function(s,i){bm+=(i+1)+'. '+s.symbol+' '+s.score+'. ';});
+      bm+='Say select '+buys.length+' buy, or open charts, or zoom one.';
+      return vSpeak(bm);
+    }
+
+    /* SELL signals list */
+    if(/sell|short|bearish/.test(t)){
+      var sells=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='S';})
+        .sort(function(a,b){return b.score-a.score;}).slice(0,5);
+      if(!sells.length)return vSpeak('No sell signals.');
+      _vLastList=sells;
+      var sm=sells.length+' sells. ';
+      sells.forEach(function(s,i){sm+=(i+1)+'. '+s.symbol+' '+s.score+'. ';});
+      sm+='Say select '+sells.length+' sell, or open charts, or zoom one.';
+      return vSpeak(sm);
+    }
+
+    /* MARKET / REGIME */
+    if(/market|regime|mood|outlook|nifty|sensex|indices|today|overall/.test(t)){
+      var rMap={full:'Bull market. All green.',bear:'Bear. All red. Stay cautious.',
+                mixed:'Mixed. Indices disagree.',caution:'Caution. Weak regime.'};
       var r=window.overallRegime||'unknown';
-      var bc2=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='B';}).length;
-      var sc2=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='S';}).length;
-      return vSpeak((rMap[r]||r)+' '+bc2+' buys, '+sc2+' sells.');
+      var bc=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='B';}).length;
+      var sc=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='S';}).length;
+      return vSpeak((rMap[r]||r)+' '+bc+' buys, '+sc+' sells.');
     }
 
-    /* ── SIGNAL COUNT ─────────────────────────────────────────── */
-    if(/how many|count|total|number|signals|stocks/.test(t)){
-      var bc3=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='B';}).length;
-      var sc3=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='S';}).length;
-      return vSpeak(bc3+' buys, '+sc3+' sells.');
-    }
-
-    /* ── P&L / POSITIONS ──────────────────────────────────────── */
-    if(/pnl|p.n.l|profit|loss|position|holding|portfolio|doing|money|returns|return/.test(t)){
+    /* POSITIONS / P&L */
+    if(/position|holding|pnl|profit|loss|portfolio|how.*doing|money/.test(t)){
       var pos=(window._brokerData&&window._brokerData.positions)||[];
       if(!pos.length)return vSpeak('No open positions. Connect Kite first.');
-      var tot2=pos.reduce(function(s,p){return s+(p.pnl||0);},0);
-      var msg3=pos.length+' positions. Total ';
-      msg3+=(tot2>=0?'plus ':'minus ')+Math.abs(Math.round(tot2)).toLocaleString('en-IN')+' rupees. ';
-      pos.slice(0,3).forEach(function(p){
-        msg3+=p.tradingsymbol+' '+(p.pnl>=0?'up':'down')+' '+Math.abs(Math.round(p.pnl))+'. ';
-      });
-      return vSpeak(msg3);
+      var tot=pos.reduce(function(s,p){return s+(p.pnl||0);},0);
+      var pm=pos.length+' positions. Total '+(tot>=0?'up ':'down ')+Math.abs(Math.round(tot)).toLocaleString('en-IN')+' rupees. ';
+      pos.slice(0,3).forEach(function(p){pm+=p.tradingsymbol+' '+(p.pnl>=0?'up':'down')+' '+Math.abs(Math.round(p.pnl))+'. ';});
+      return vSpeak(pm);
     }
 
-    /* ── BEST PICK ────────────────────────────────────────────── */
-    if(/best|top pick|strongest|highest|number one|first/.test(t)){
+    /* BEST pick */
+    if(/best|strongest|top pick|number one|highest/.test(t)){
       var best=(window.allSignals||[]).sort(function(a,b){return b.score-a.score;})[0];
-      if(!best)return vSpeak('No signals loaded yet.');
+      if(!best)return vSpeak('No signals loaded.');
       _vLastList=[best];
-      return vSpeak('Best is '+best.symbol+', score '+best.score
-        +', entry '+(+best.cmp||0).toFixed(0)
-        +', target '+((+best.tp||0).toFixed(0))
-        +'. Say open to chart it.');
+      return vSpeak('Best: '+best.symbol+', score '+best.score
+        +', entry '+(+best.cmp).toFixed(0)+', target '+(+best.tp).toFixed(0)
+        +'. Say zoom or open to chart it.');
     }
 
-    /* ── SPECIFIC SYMBOL ──────────────────────────────────────── */
+    /* SPECIFIC SYMBOL */
     var allSyms=Object.keys(window.allStockData||{});
-    var foundSym=null;
     for(var i=0;i<allSyms.length;i++){
-      var s=allSyms[i].toLowerCase();
-      if(new RegExp('\\b'+s+'\\b').test(t)){foundSym=allSyms[i];break;}
-    }
-    if(foundSym){
-      var sig=(window.allSignals||[]).find(function(x){return x.symbol===foundSym;});
-      if(sig){
-        _vLastList=[sig];
-        return vSpeak(foundSym+': '+(sig.signal.charAt(0)==='B'?'buy':'sell')
-          +', score '+sig.score
-          +', entry '+(+sig.cmp||0).toFixed(0)
-          +', target '+((+sig.tp||0).toFixed(0))
-          +'. Say open to chart it.');
+      if(new RegExp('\\b'+allSyms[i].toLowerCase()+'\\b').test(t)){
+        var sig=(window.allSignals||[]).find(function(x){return x.symbol===allSyms[i];});
+        if(sig){
+          _vLastList=[sig];
+          return vSpeak(allSyms[i]+': '+(sig.signal.charAt(0)==='B'?'buy':'sell')
+            +', score '+sig.score+', entry '+(+sig.cmp).toFixed(0)
+            +', target '+(+sig.tp).toFixed(0)+'. Say zoom to chart it.');
+        }
+        return vSpeak(allSyms[i]+' loaded but no signal today.');
       }
-      return vSpeak(foundSym+' loaded but no active signal today.');
     }
 
-    /* ── CHART / CLOSE / PAUSE / REFRESH ──────────────────────── */
-    if(/close|back|grid|exit/.test(t)){
-      if(typeof window.mcoZoomClose==='function')window.mcoZoomClose();
-      if(typeof window.mcoClose==='function')window.mcoClose();
-      return vSpeak('Closed.');
-    }
-    if(/pause|freeze|stop chart/.test(t)){
-      if(typeof window.mcoPauseToggle==='function')window.mcoPauseToggle();
-      return vSpeak('Paused.');
-    }
-    if(/resume|play|unfreeze/.test(t)){
-      if(typeof window.mcoPauseToggle==='function')window.mcoPauseToggle();
-      return vSpeak('Resumed.');
-    }
-    if(/refresh|update|reload|latest/.test(t)){
-      if(typeof window.mcoTick==='function')window.mcoTick();
-      return vSpeak('Refreshing.');
+    /* HELP */
+    if(/help|what can|commands|how do i/.test(t)){
+      return vSpeak('Say: buy signals, sell signals, market, select 10 buy, open charts, zoom FDC, next, previous, initiate buy, set quantity 50, confirm order, positions, refresh, pause, or resume.');
     }
 
-    /* ── HELP ─────────────────────────────────────────────────── */
-    if(/help|what|how|commands|options/.test(t)){
-      return vSpeak('Say: buy signals, sell signals, market, positions, or best signal. After any list, say open, or open 2, open 3 to chart them.');
-    }
-
-    /* ── FALLBACK ─────────────────────────────────────────────── */
+    /* FALLBACK */
     vAskClaude(text);
   }
 
