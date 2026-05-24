@@ -5493,12 +5493,15 @@ function mcoZoomClose() {
   ══════════════════════════════ */
   function vParse(text){
     var t=text.toLowerCase().trim();
+    /* strip filler words Groq sometimes prepends */
+    t=t.replace(/^(okay|ok|hey|tram|hi|hello|uh|um|so|well|please|can you|could you|tell me|show me|give me|what are|what is|whats|i want to know|i want)\s+/,'').trim();
 
-    if(/top.*(buy|long)|buy.*(signal|stock)/i.test(t)){
+    /* ── BUY signals ─────────────────────────────────────────── */
+    if(/buy|long|bullish|b2|b3/.test(t)){
       var b=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='B';})
            .sort(function(a,c){return c.score-a.score;}).slice(0,5);
-      if(!b.length)return vSpeak('No buy signals loaded. Please import your CSV data first.');
-      var m='Top '+b.length+' buy signals: ';
+      if(!b.length)return vSpeak('No buy signals loaded yet. Please import your CSV data first.');
+      var m='Top '+b.length+' buy signals today. ';
       b.forEach(function(s,i){
         m+=(i+1)+'. '+s.symbol+', score '+s.score
          +', entry '+(+s.cmp||0).toFixed(0)
@@ -5508,81 +5511,124 @@ function mcoZoomClose() {
       return vSpeak(m);
     }
 
-    if(/top.*(sell|short)|sell.*(signal|stock)/i.test(t)){
+    /* ── SELL signals ────────────────────────────────────────── */
+    if(/sell|short|bearish|s2|s3/.test(t)){
       var s2=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='S';})
             .sort(function(a,c){return c.score-a.score;}).slice(0,5);
       if(!s2.length)return vSpeak('No sell signals found.');
-      var m2='Top '+s2.length+' sell signals: ';
+      var m2='Top '+s2.length+' sell signals today. ';
       s2.forEach(function(s,i){m2+=(i+1)+'. '+s.symbol+', score '+s.score+'. ';});
       return vSpeak(m2);
     }
 
-    if(/regime|market.*(mood|condition|status)|overall/i.test(t)){
+    /* ── MARKET / REGIME ─────────────────────────────────────── */
+    if(/market|regime|mood|condition|status|trend|outlook|overall|indices|nifty|sensex|today/.test(t)){
       var rMap={
         full:'Full bull market. All indices are green. Good environment for buying.',
         bear:'Bear regime. All indices are red. Stay very cautious.',
-        mixed:'Mixed signals. Indices are disagreeing. Trade selectively.',
-        caution:'Caution mode. Weak regime. Raise your minimum score filter.'
+        mixed:'Mixed signals. Indices are disagreeing. Trade selectively with higher score cutoff.',
+        caution:'Caution mode. Weak regime. Raise your minimum score filter above 70.'
       };
       var r=window.overallRegime||'unknown';
-      return vSpeak('Market regime is: '+(rMap[r]||r));
+      var bc2=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='B';}).length;
+      var sc2=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='S';}).length;
+      return vSpeak((rMap[r]||'Regime is '+r)+' Scanner shows '+bc2+' buys and '+sc2+' sells right now.');
     }
 
-    if(/how many|count.*(signal|stock)|total.*(signal|stock)/i.test(t)){
-      var bc=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='B';}).length;
-      var sc=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='S';}).length;
+    /* ── SIGNAL COUNT ────────────────────────────────────────── */
+    if(/how many|count|total|number|signals|stocks/.test(t)){
+      var bc3=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='B';}).length;
+      var sc3=(window.allSignals||[]).filter(function(s){return s.signal.charAt(0)==='S';}).length;
       var tot=Object.keys(window.allStockData||{}).length;
-      return vSpeak(bc+' buy signals and '+sc+' sell signals across '+tot+' symbols loaded.');
+      return vSpeak(bc3+' buy signals and '+sc3+' sell signals across '+tot+' symbols loaded.');
     }
 
-    if(/p.?n.?l|profit|loss|position|holding|portfolio|how.*doing/i.test(t)){
+    /* ── P&L / POSITIONS ─────────────────────────────────────── */
+    if(/pnl|p.n.l|profit|loss|position|holding|portfolio|doing|money|returns|return/.test(t)){
       var pos=(window._brokerData&&window._brokerData.positions)||[];
-      if(!pos.length)return vSpeak('No open positions. Connect Kite and refresh broker data.');
+      if(!pos.length)return vSpeak('No open positions found. Make sure Kite is connected and broker data is refreshed.');
       var tot2=pos.reduce(function(s,p){return s+(p.pnl||0);},0);
       var msg3='You have '+pos.length+' open position'+(pos.length>1?'s':'')+'. ';
-      msg3+='Total P and L is '+(tot2>=0?'plus':'minus')+' '+Math.abs(Math.round(tot2)).toLocaleString('en-IN')+' rupees. ';
+      msg3+='Total P and L today is '+(tot2>=0?'plus':'minus')+' '+Math.abs(Math.round(tot2)).toLocaleString('en-IN')+' rupees. ';
       pos.slice(0,3).forEach(function(p){
         msg3+=p.tradingsymbol+' is '+(p.pnl>=0?'up':'down')+' '+Math.abs(Math.round(p.pnl))+' rupees. ';
       });
       return vSpeak(msg3);
     }
 
-    if(/\bpause\b/i.test(t)){
-      if(typeof window.mcoPauseToggle==='function'&&!window._mcoPaused){window.mcoPauseToggle();return vSpeak('Charts paused.');}
-      return vSpeak('Charts are already paused.');
+    /* ── BEST / TOP PICK ─────────────────────────────────────── */
+    if(/best|top pick|strongest|highest score|number one|first/.test(t)){
+      var best=(window.allSignals||[]).sort(function(a,b){return b.score-a.score;})[0];
+      if(!best)return vSpeak('No signals loaded yet.');
+      return vSpeak('Best signal right now is '+best.symbol
+        +', a '+(best.signal.charAt(0)==='B'?'buy':'sell')
+        +' with score '+best.score
+        +', entry '+(+best.cmp||0).toFixed(0)
+        +', target '+((+best.tp||0).toFixed(0))
+        +', stop '+((+best.sl||0).toFixed(0))+'.');
     }
 
-    if(/\bresume\b/i.test(t)){
-      if(typeof window.mcoPauseToggle==='function'&&window._mcoPaused){window.mcoPauseToggle();return vSpeak('Charts resumed.');}
-      return vSpeak('Charts are already running.');
+    /* ── SPECIFIC SYMBOL ─────────────────────────────────────── */
+    /* Try to find any known stock symbol mentioned in the utterance */
+    var allSyms=Object.keys(window.allStockData||{});
+    var foundSym=null;
+    for(var i=0;i<allSyms.length;i++){
+      var s=allSyms[i].toLowerCase();
+      /* match whole word only to avoid false positives */
+      if(new RegExp('\\b'+s+'\\b').test(t)){foundSym=allSyms[i];break;}
+    }
+    if(foundSym){
+      var sig=(window.allSignals||[]).find(function(x){return x.symbol===foundSym;});
+      if(sig){
+        return vSpeak(foundSym+' has a '+(sig.signal.charAt(0)==='B'?'buy':'sell')+' signal. '
+          +'Score '+sig.score+'. Entry '+(+sig.cmp||0).toFixed(0)
+          +', target '+((+sig.tp||0).toFixed(0))
+          +', stop '+((+sig.sl||0).toFixed(0))+'.');
+      }
+      return vSpeak(foundSym+' is loaded but has no active signal today.');
     }
 
-    if(/refresh|update.*(chart|data)/i.test(t)){
-      if(typeof window.mcoTick==='function'){window.mcoTick();return vSpeak('Refreshing charts now.');}
+    /* ── CHART ACTIONS ───────────────────────────────────────── */
+    if(/open|show|chart|zoom|load/.test(t)){
+      var cm=t.match(/\b([a-z0-9&]{2,10})\s*(?:chart|graph|candle)?$/i);
+      if(cm){
+        var sym2=cm[1].toUpperCase();
+        if(window._mcoSel&&window._mcoSel[sym2]){
+          if(typeof window.mcoZoomOpen==='function')window.mcoZoomOpen(sym2,'');
+          return vSpeak('Opening chart for '+sym2+'.');
+        }
+      }
     }
 
-    if(/close|back to grid|go back/i.test(t)){
+    /* ── CLOSE ───────────────────────────────────────────────── */
+    if(/close|back|grid|exit|go back/.test(t)){
       if(typeof window.mcoZoomClose==='function')window.mcoZoomClose();
       if(typeof window.mcoClose==='function')window.mcoClose();
       return vSpeak('Closed.');
     }
 
-    var cm=t.match(/(?:open|show|chart|zoom|load)(?:\s+chart)?(?:\s+for)?\s+([a-z0-9&]+)\s*$/i);
-    if(cm){
-      var sym=cm[1].toUpperCase().trim();
-      if(window._mcoSel&&window._mcoSel[sym]){
-        if(typeof window.mcoZoomOpen==='function')window.mcoZoomOpen(sym,'');
-        return vSpeak('Opening chart for '+sym+'.');
-      }
-      var inSig=!!(window.allSignals||[]).find(function(s){return s.symbol===sym;});
-      if(inSig)return vSpeak(sym+' is in the scanner but not in your chart grid. Select it with the checkbox first.');
-      return vSpeak('Symbol '+sym+' not found in loaded data.');
+    /* ── PAUSE / RESUME ──────────────────────────────────────── */
+    if(/pause|stop chart|freeze/.test(t)){
+      if(typeof window.mcoPauseToggle==='function'){window.mcoPauseToggle();}
+      return vSpeak('Charts paused.');
+    }
+    if(/resume|start chart|unfreeze|play/.test(t)){
+      if(typeof window.mcoPauseToggle==='function'){window.mcoPauseToggle();}
+      return vSpeak('Charts resumed.');
     }
 
-    if(/help|what can you|commands/i.test(t)){
-      return vSpeak('You can say: top buy signals, top sell signals, market regime, signal count, P and L, open chart for a symbol, refresh, pause, or resume. Add an Anthropic key in voice settings for free-form questions.');
+    /* ── REFRESH ─────────────────────────────────────────────── */
+    if(/refresh|update|reload|latest/.test(t)){
+      if(typeof window.mcoTick==='function')window.mcoTick();
+      return vSpeak('Refreshing data now.');
     }
 
+    /* ── HELP ────────────────────────────────────────────────── */
+    if(/help|what|how|commands|options|tell me/.test(t)){
+      return vSpeak('You can ask me: show buy signals, show sell signals, market outlook, my positions, best signal, or name any stock like F D C or Reliance. Just speak naturally.');
+    }
+
+    /* ── FALLBACK: try Claude or give a friendly spoken guide ── */
     vAskClaude(text);
   }
 
@@ -5592,7 +5638,7 @@ function mcoZoomClose() {
   function vAskClaude(text){
     var key=vGetAnthKey();
     if(!key){
-      return vSpeak('Command not recognised. Say help for the full list, or add an Anthropic API key in voice settings for smart free-form answers.');
+      return vSpeak('I heard: '+text.slice(0,50)+'. Try saying: buy signals, sell signals, market outlook, positions, or best signal.');
     }
     vLog('🤖 Asking Claude…');
     if(_vSynth)_vSynth.cancel();
