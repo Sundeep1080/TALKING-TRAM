@@ -411,6 +411,9 @@ tr.earn td:first-child{border-left:3px solid var(--pink)}
 #mcoZoomMain{flex:1;min-height:0}
 #mcoZoomSmi{height:120px;flex-shrink:0;border-top:1px solid var(--border);position:relative}
 #mcoZoomSmiLbl{position:absolute;top:3px;left:6px;font-family:var(--mono);font-size:9px;color:var(--amber);z-index:2;pointer-events:none}
+#mcoColorPicker{display:flex;align-items:center;gap:6px;padding:0 6px}
+#mcoUpColorInp{width:22px;height:22px;border:none;border-radius:4px;cursor:pointer;padding:0;background:none}
+#mcoColorPicker label{font-family:var(--mono);font-size:9px;color:var(--text2)}
 #mcoZoomLegend{display:flex;gap:14px;padding:4px 12px;background:var(--bg2);border-bottom:1px solid var(--border);flex-shrink:0;flex-wrap:wrap}
 #mcoZoomLegend span{font-family:var(--mono);font-size:9px}
 .mco-cell{cursor:default}
@@ -4783,6 +4786,10 @@ function renderGapOpen(){
       <option value="day">Daily</option>
     </select>
     <button onclick="mcoApplyAll()" style="background:var(--amber);color:#000;border:none;border-radius:5px;padding:4px 11px;font-family:var(--mono);font-size:10px;font-weight:700;cursor:pointer;margin-left:4px">Apply All</button>
+    <div id="mcoColorPicker">
+      <label>Up candle</label>
+      <input type="color" id="mcoUpColorInp" value="#22c55e" title="Up candle colour" onchange="mcoApplyColor(this.value)">
+    </div>
     <button class="mco-close" onclick="mcoClose()">✕ Close</button>
   </div>
   <div id="mcoGrid"></div>
@@ -4843,12 +4850,42 @@ function mcoClear() {
 }
 
 // ── Token resolution ──
+var _mcoUpColor = localStorage.getItem('tram_up_color') || '#22c55e';
+
+function mcoGetUpColor() { return _mcoUpColor; }
+
+function mcoApplyColor(col) {
+  _mcoUpColor = col;
+  localStorage.setItem('tram_up_color', col);
+  /* update all live grid cells */
+  Object.values(_mcoInst).forEach(function(inst) {
+    try {
+      inst.csSeries && inst.csSeries.applyOptions({
+        upColor: col, borderUpColor: col, wickUpColor: col
+      });
+    } catch(e) {}
+  });
+  /* update zoom chart if open */
+  if (_zoomCsSeries) {
+    try {
+      _zoomCsSeries.applyOptions({
+        upColor: col, borderUpColor: col, wickUpColor: col
+      });
+    } catch(e) {}
+  }
+  /* sync both pickers */
+  var g = document.getElementById('mcoUpColorInp');
+  var z = document.getElementById('mcoUpColorInpZ');
+  if (g) g.value = col;
+  if (z) z.value = col;
+}
+
 function mcoResolveToken(sym) {
   return new Promise(function(resolve) {
     if (_mcoTokCache[sym]) { resolve(_mcoTokCache[sym]); return; }
     var embedded = getEmbeddedTokenMap();
     if (embedded[sym]) { _mcoTokCache[sym]=embedded[sym]; resolve(embedded[sym]); return; }
-    fetch(ZD_WORKER+'/kite/quote?i=NSE:'+sym, {headers:{'X-Kite-Version':'3','Authorization':'token '+zdApiKey+':'+zdToken}})
+    fetch(ZD_WORKER+'/kite/quote?i='+encodeURIComponent('NSE:'+sym), {headers:{'X-Kite-Version':'3','Authorization':'token '+zdApiKey+':'+zdToken}})
       .then(function(r){return r.json();})
       .then(function(j){
         var tok = j&&j.data&&j.data['NSE:'+sym]&&j.data['NSE:'+sym].instrument_token;
@@ -4881,7 +4918,13 @@ function mcoFetch(sym, interval, daysBack) {
           return istMins >= 555 && istMins <= 930;
         }).map(function(c){
           return {
-            time: interval==='day' ? c[0].slice(0,10) : Math.floor(new Date(c[0]).getTime()/1000),
+            time: (function(){
+              if(interval==='day'){
+                var d=c[0].slice(0,10).split('-');
+                return {year:parseInt(d[0]),month:parseInt(d[1]),day:parseInt(d[2])};
+              }
+              return Math.floor(new Date(c[0]).getTime()/1000);
+            })(),
             open:c[1],high:c[2],low:c[3],close:c[4],volume:c[5]||0
           };
         });
@@ -5046,7 +5089,7 @@ function mcoRenderCell(sym, sigObj, interval, cellId) {
     };
 
     var mainChart=LightweightCharts.createChart(mainDiv, Object.assign({},baseOpt,{width:mainDiv.clientWidth||300,height:mainDiv.clientHeight||180}));
-    var cs=mainChart.addCandlestickSeries({upColor:'#00bcd4',downColor:'#000000',borderUpColor:'#00bcd4',borderDownColor:'#000000',wickUpColor:'#00bcd4',wickDownColor:'#555555'});
+    var cs=mainChart.addCandlestickSeries({upColor:mcoGetUpColor(),downColor:'#000000',borderUpColor:mcoGetUpColor(),borderDownColor:'#000000',wickUpColor:mcoGetUpColor(),wickDownColor:'#555555'});
     cs.setData(candles);
     if(sigObj.tp)  cs.createPriceLine({price:sigObj.tp, color:'#059669',lineWidth:1,lineStyle:LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:'TP'});
     if(sigObj.sl)  cs.createPriceLine({price:sigObj.sl, color:'#dc2626',lineWidth:1,lineStyle:LightweightCharts.LineStyle.Dashed,axisLabelVisible:true,title:'SL'});
@@ -5180,6 +5223,14 @@ function mcoTfOpts(sel){
 }
 
 // ── Open overlay ──
+function mcoInitColorPicker() {
+  var col = mcoGetUpColor();
+  var g = document.getElementById('mcoUpColorInp');
+  var z = document.getElementById('mcoUpColorInpZ');
+  if (g) g.value = col;
+  if (z) z.value = col;
+}
+
 function mcoOpen() {
   var syms=Object.values(_mcoSel);
   if(!syms.length){toast('Select stocks using checkboxes first','err');return;}
@@ -5225,6 +5276,7 @@ function mcoOpen() {
   overlay.classList.add('mco-active');
   document.body.style.overflow='hidden';
   _mcoPaused=false; mcoUpdatePauseBtn();
+  mcoInitColorPicker();
 
   var chain=Promise.resolve();
   syms.forEach(function(s,idx){
@@ -5392,7 +5444,7 @@ function mcoClose() {
 // ZOOM CHART ENGINE
 // ══════════════════════════════════════════════════════
 
-var _zoomChart=null, _zoomSmi=null, _zoomRo=null;
+var _zoomChart=null, _zoomSmi=null, _zoomRo=null, _zoomCsSeries=null;
 var _zoomSym=null, _zoomSigObj=null, _zoomTf='5minute';
 
 // Fetch daily candles to get today's High/Low
@@ -5527,11 +5579,12 @@ function mcoZoomRender() {
       width:mainDiv.clientWidth||800, height:mainDiv.clientHeight||500
     }));
 
+    _zoomCsSeries=null;
     var cs=_zoomChart.addCandlestickSeries({
-      upColor:'#00bcd4',downColor:'#000000',
-      borderUpColor:'#00bcd4',borderDownColor:'#000000',
-      wickUpColor:'#00bcd4',wickDownColor:'#555555'
-    });
+      upColor:mcoGetUpColor(),downColor:'#000000',
+      borderUpColor:mcoGetUpColor(),borderDownColor:'#000000',
+      wickUpColor:mcoGetUpColor(),wickDownColor:'#555555'
+    }); _zoomCsSeries=cs;
     cs.setData(candles);
 
     // ── KEY LEVELS ── Day Low (most important — entry trigger)
@@ -5605,6 +5658,12 @@ function mcoZoomClose() {
 <div id="mcoZoom">
   <div id="mcoZoomHdr">
     <button id="mcoZoomBack" onclick="mcoZoomClose()">← Back to Grid</button>
+      <div style="display:flex;align-items:center;gap:5px;margin-left:6px">
+        <label style="font-family:var(--mono);font-size:9px;color:var(--text2)">Up colour</label>
+        <input type="color" id="mcoUpColorInpZ" value="#22c55e" title="Up candle colour"
+          style="width:22px;height:22px;border:none;border-radius:4px;cursor:pointer;padding:0;background:none"
+          onchange="mcoApplyColor(this.value);var g=document.getElementById('mcoUpColorInp');if(g)g.value=this.value;">
+      </div>
     <div>
       <div id="mcoZoomTitle">—</div>
       <div id="mcoZoomMeta">—</div>
